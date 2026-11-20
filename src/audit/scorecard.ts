@@ -36,10 +36,10 @@ export function getRagLabel(rag: RagBand): string {
 
 export function getLetterGrade(score: number | null): LetterGrade {
   if (score === null) return 'N/A';
-  if (score >= 85) return 'A';
-  if (score >= 70) return 'B';
-  if (score >= 55) return 'C';
-  if (score >= 40) return 'D';
+  if (score >= 90) return 'A';
+  if (score >= 80) return 'B';
+  if (score >= 65) return 'C';
+  if (score >= 50) return 'D';
   return 'F';
 }
 
@@ -88,10 +88,13 @@ export function computeIgnoredLeadsEstimate(
 
   const effectiveLossPct = Math.min(85, Math.max(0, slowLoad + missingContactPct + lowReviewTrust));
 
+  const currency = assumptions.currency ?? 'PHP';
+
   const visitors = assumptions.monthlyVisitors;
   if (visitors === null || !Number.isFinite(visitors) || visitors <= 0) {
     return {
       visible: false,
+      currency,
       monthlyVisitors: null,
       inquiryRatePct: assumptions.inquiryRatePct,
       avgBookingValuePhp: assumptions.avgBookingValuePhp,
@@ -129,6 +132,7 @@ export function computeIgnoredLeadsEstimate(
 
   return {
     visible: true,
+    currency,
     monthlyVisitors: visitors,
     inquiryRatePct: assumptions.inquiryRatePct,
     avgBookingValuePhp: hasBookingVal ? bookingVal : null,
@@ -264,11 +268,14 @@ export function buildOutreachSummary(
   const displayClient = clientName.trim() || 'your team';
   const displayUrl = websiteUrl.trim() || 'your website';
   const isProvisional = scorecard.isProvisional ?? scorecard.dataCompletenessPct < 70;
-  const provisionalBadge = isProvisional ? ' [Provisional]' : '';
   const scorePart =
     scorecard.overallScore !== null
-      ? `${scorecard.overallScore}/100 (Grade ${scorecard.grade}${provisionalBadge})`
-      : `incomplete${provisionalBadge}`;
+      ? isProvisional
+        ? `${scorecard.overallScore}/100 (preliminary, based on your public website)`
+        : `${scorecard.overallScore}/100 (Grade ${scorecard.grade})`
+      : isProvisional
+      ? 'incomplete (preliminary, based on your public website)'
+      : 'incomplete';
 
   const top3 = scorecard.fixFirst.slice(0, 3);
   const bullets =
@@ -292,10 +299,6 @@ export function buildOutreachSummary(
     for (const note of auditNotes) {
       lines.push(`Note: ${note.message}`);
     }
-  }
-
-  if (isProvisional) {
-    lines.push(``, `Add Google Business Profile data for a final grade.`);
   }
 
   lines.push(

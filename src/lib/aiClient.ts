@@ -78,6 +78,112 @@ function formatZodIssues(error: z.ZodError): string {
     .join('\n');
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeForNumberMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/(\d),(?=\d{3}(?:\D|$))/g, '$1')
+    .replace(/(\d)\s+(%|(?:ms|s|mb|kb|gb)\b)/gi, '$1$2');
+}
+
+const QUARTER_LABEL_REGEX = /\bQ[1-4]\b/g;
+const NUMERIC_TOKEN_REGEX =
+  /(?<![A-Za-z0-9.])\d[\d,]*(?:\.\d+)?(?:\s*(?:%|ms\b|s\b|mb\b|kb\b|gb\b))?/gi;
+
+export interface NumberGroundingViolation {
+  location: string;
+  sceneIndex?: number;
+  outcomeIndex?: number;
+  findingRef?: string;
+  token: string;
+}
+
+export interface NumberGroundingResult {
+  valid: boolean;
+  violations: NumberGroundingViolation[];
+  offendingSceneIndices: number[];
+}
+
+export function validateNumbersGrounded(
+  output: WalkthroughData,
+  allowedText: string
+): NumberGroundingResult {
+  const normalizedAllowed = normalizeForNumberMatch(allowedText || '');
+  const violations: NumberGroundingViolation[] = [];
+  const sceneIndexSet = new Set<number>();
+
+  const isTokenGrounded = (rawToken: string): boolean => {
+    const compact = rawToken.toLowerCase().replace(/,/g, '').replace(/\s+/g, '');
+    if (!compact) return true;
+    if (compact === '2027') return true;
+    const matcher = new RegExp(`(?:^|[^0-9.])${escapeRegExp(compact)}(?![0-9.%])`, 'i');
+    return matcher.test(normalizedAllowed);
+  };
+
+  const scanText = (
+    text: string,
+    meta: { location: string; sceneIndex?: number; outcomeIndex?: number; findingRef?: string }
+  ) => {
+    const withoutQuarters = text.replace(QUARTER_LABEL_REGEX, ' ');
+    const matches = withoutQuarters.match(NUMERIC_TOKEN_REGEX);
+    if (!matches) return;
+    for (const token of matches) {
+      if (!isTokenGrounded(token)) {
+        violations.push({
+          location: meta.location,
+          sceneIndex: meta.sceneIndex,
+          outcomeIndex: meta.outcomeIndex,
+          findingRef: meta.findingRef,
+          token: token.trim(),
+        });
+        if (meta.sceneIndex !== undefined) {
+          sceneIndexSet.add(meta.sceneIndex);
+        }
+      }
+    }
+  };
+
+  output.scenes.forEach((scene, idx) => {
+    scanText(scene.caption, { location: `scenes[${idx}].caption`, sceneIndex: idx });
+    scanText(scene.narration, { location: `scenes[${idx}].narration`, sceneIndex: idx });
+  });
+
+  output.outcomes.forEach((outcome, idx) => {
+    scanText(outcome.description, {
+      location: `outcomes[${idx}].description`,
+      outcomeIndex: idx,
+      findingRef: outcome.findingRef,
+    });
+  });
+
+  // Map outcome-only violations to matching scene(s) referencing that findingRef (or fallback scene index)
+  for (const v of violations) {
+    if (v.sceneIndex === undefined && v.outcomeIndex !== undefined) {
+      let matchedAnyScene = false;
+      if (v.findingRef) {
+        output.scenes.forEach((scene, sIdx) => {
+          if (scene.findingRefs?.includes(v.findingRef!)) {
+            sceneIndexSet.add(sIdx);
+            matchedAnyScene = true;
+          }
+        });
+      }
+      if (!matchedAnyScene && output.scenes.length > 0) {
+        sceneIndexSet.add(Math.min(v.outcomeIndex, output.scenes.length - 1));
+      }
+    }
+  }
+
+  return {
+    valid: violations.length === 0,
+    violations,
+    offendingSceneIndices: Array.from(sceneIndexSet).sort((a, b) => a - b),
+  };
+}
+
 export interface ModelOption {
   id: string;
   name: string;
@@ -311,6 +417,7 @@ export interface GenerateTourOptions {
   pageFacts?: PageFacts | null;
   findings?: AuditFinding[];
   onStage?: (stage: string) => void;
+  completeChat?: (messages: Array<{ role: string; content: unknown }>) => Promise<string>;
 }
 
 export async function generateWalkthrough({
@@ -320,6 +427,7 @@ export async function generateWalkthrough({
   pageFacts,
   findings = [],
   onStage,
+  completeChat,
 }: GenerateTourOptions): Promise<WalkthroughData> {
   const nonPassFindings = findings
     .filter((f) => f.status === 'fail' || f.status === 'warn')
@@ -399,6 +507,17 @@ export async function generateWalkthrough({
         ].join('\n')
       : '';
 
+  const allowedNumberText = [
+    project.brief,
+    ...(nonPassFindings.length > 0 ? nonPassFindings.map((f) => f.evidence) : findings.map((f) => f.evidence)),
+    pageFacts?.title || '',
+    pageFacts?.description || '',
+    ...(pageFacts?.headings || []),
+    ...(pageFacts?.ctas || []),
+  ]
+    .filter(Boolean)
+    .join('\n');
+
   const userContent: ChatMessageContent = [
     {
       type: 'text',
@@ -438,8 +557,11 @@ export async function generateWalkthrough({
     { role: 'user', content: userContent },
   ];
 
+  const runCompletion = (msgs: ChatMessage[]): Promise<string> =>
+    completeChat ? completeChat(msgs) : callChatCompletions(settings, msgs);
+
   onStage?.('Sending screenshots and brief to your AI model...');
-  const firstRaw = await callChatCompletions(settings, messages);
+  const firstRaw = await runCompletion(messages);
 
   const attachReadOnlyEvidence = (data: WalkthroughData): WalkthroughData => {
     if (nonPassFindings.length === 0) return data;
@@ -460,7 +582,7 @@ export async function generateWalkthrough({
     };
   };
 
-  const parseAndValidate = (raw: string): { data?: WalkthroughData; errorText?: string } => {
+  const parseSchemaOnly = (raw: string): { data?: WalkthroughData; errorText?: string } => {
     const cleaned = stripJsonFences(raw);
     let parsedJson: unknown;
     try {
@@ -481,13 +603,21 @@ export async function generateWalkthrough({
     return { data: attachReadOnlyEvidence(result.data) };
   };
 
-  const firstAttempt = parseAndValidate(firstRaw);
+  const firstAttempt = parseSchemaOnly(firstRaw);
+  let retryErrorText = firstAttempt.errorText;
   if (firstAttempt.data) {
-    return firstAttempt.data;
+    const grounding = validateNumbersGrounded(firstAttempt.data, allowedNumberText);
+    if (grounding.valid) {
+      return firstAttempt.data;
+    }
+    retryErrorText = [
+      'Ungrounded numbers detected. Quote numbers ONLY from FINDINGS evidence, the brief, pageFacts, the year 2027, or Q1-Q4:',
+      ...grounding.violations.map((v) => `- ${v.location}: "${v.token}"`),
+    ].join('\n');
   }
 
-  // Retry exactly once, sending back the validation errors (including any unknown findingRefs)
-  onStage?.('Response needed formatting fixes — retrying once with validation details...');
+  // Retry exactly once, sending back validation / number-grounding errors
+  onStage?.('Response needed grounding or formatting fixes — retrying once...');
   const retryMessages: ChatMessage[] = [
     ...messages,
     { role: 'assistant', content: firstRaw },
@@ -495,21 +625,31 @@ export async function generateWalkthrough({
       role: 'user',
       content: [
         'Your previous response did not pass validation:',
-        firstAttempt.errorText || 'Unknown validation error.',
+        retryErrorText || 'Unknown validation error.',
         '',
         `Remember: screenshotIndex must be an integer between 0 and ${screenshots.length - 1}, highlight x/y/w/h must be numbers between 0 and 100 (w and h >= 1), roadmap quarters must be "Q1", "Q2", "Q3", or "Q4"${
           validFindingIds.length > 0
             ? `, and scene findingRefs may ONLY contain IDs from: ${validFindingIds.join(', ')}`
             : ''
-        }. Return ONLY valid JSON matching the schema with no markdown code fences.`,
+        }. Every number, percentage, or measurement must come directly from the provided FINDINGS evidence, brief, pageFacts, or be 2027 / Q1-Q4. Return ONLY valid JSON matching the schema with no markdown code fences.`,
       ].join('\n'),
     },
   ];
 
-  const secondRaw = await callChatCompletions(settings, retryMessages);
-  const secondAttempt = parseAndValidate(secondRaw);
+  const secondRaw = await runCompletion(retryMessages);
+  const secondAttempt = parseSchemaOnly(secondRaw);
   if (secondAttempt.data) {
-    return secondAttempt.data;
+    const retryGrounding = validateNumbersGrounded(secondAttempt.data, allowedNumberText);
+    if (retryGrounding.valid) {
+      return secondAttempt.data;
+    }
+    const offendingSet = new Set(retryGrounding.offendingSceneIndices);
+    return {
+      ...secondAttempt.data,
+      scenes: secondAttempt.data.scenes.map((scene, idx) =>
+        offendingSet.has(idx) ? { ...scene, needsReview: true } : scene
+      ),
+    };
   }
 
   throw new Error(

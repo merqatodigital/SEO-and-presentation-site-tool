@@ -23,6 +23,9 @@ export const BUSINESS_SCHEMA_TYPES = new Set([
 const CTA_PATTERN =
   /\b(?:book\s+a\s+call|book|booking|reserve|reservation|availability|check\s+rates|inquire|enquire|contact\s+us|get\s+in\s+touch|request\s+a\s+quote|get\s+a\s+quote|call\s+us|message\s+us|start\s+a\s+project|magpa-?book|mag-?reserve)\b/i;
 
+const CTA_IGNORE_PATTERN =
+  /(?:nature|marine|wildlife|forest|bird)\s+reserve|reserve\s+(?:area|park)|availability\s+of\s/i;
+
 const CHAT_HREF_CTA_PATTERN =
   /(?:^|\/\/)(?:wa\.me|api\.whatsapp\.com|chat\.whatsapp\.com|(?:www\.)?(?:m\.me|messenger\.com))\b|^viber:\/\//i;
 
@@ -319,13 +322,14 @@ export function parseHtmlWithCheerio(html: string): ParsedHtmlFacts {
     }
 
     const visibleText = $(el).text().replace(/\s+/g, ' ').trim();
-    const isChatDirectCta = CHAT_HREF_CTA_PATTERN.test(href) && visibleText.length > 0;
-    if (
-      visibleText &&
-      visibleText.length <= 80 &&
-      (CTA_PATTERN.test(visibleText) || isChatDirectCta) &&
-      !seenCtas.has(visibleText)
-    ) {
+    const isChatDirectCta =
+      CHAT_HREF_CTA_PATTERN.test(href) && visibleText.length > 0 && visibleText.length <= 80;
+    const isPatternCta =
+      visibleText.length > 0 &&
+      visibleText.length <= 40 &&
+      !CTA_IGNORE_PATTERN.test(visibleText) &&
+      CTA_PATTERN.test(visibleText);
+    if ((isPatternCta || isChatDirectCta) && !seenCtas.has(visibleText)) {
       seenCtas.add(visibleText);
       ctaTexts.push(visibleText);
     }
@@ -337,12 +341,12 @@ export function parseHtmlWithCheerio(html: string): ParsedHtmlFacts {
         ? $(el).attr('value') || ''
         : $(el).text() || '';
     const visibleText = raw.replace(/\s+/g, ' ').trim();
-    if (
-      visibleText &&
-      visibleText.length <= 80 &&
-      CTA_PATTERN.test(visibleText) &&
-      !seenCtas.has(visibleText)
-    ) {
+    const isPatternCta =
+      visibleText.length > 0 &&
+      visibleText.length <= 40 &&
+      !CTA_IGNORE_PATTERN.test(visibleText) &&
+      CTA_PATTERN.test(visibleText);
+    if (isPatternCta && !seenCtas.has(visibleText)) {
       seenCtas.add(visibleText);
       ctaTexts.push(visibleText);
     }
@@ -543,7 +547,7 @@ export function buildAutomatedFindings(input: BuildAutomatedFindingsInput): Audi
 
   findings.push({
     id: 'speed-images-alt',
-    category: 'speed',
+    category: 'seo',
     label: 'Image alt descriptions',
     status: !parsed
       ? 'unknown'
@@ -661,9 +665,7 @@ export function buildAutomatedFindings(input: BuildAutomatedFindingsInput): Audi
         ? 'unknown'
         : robotsTxt.allowsIndexing === false
         ? 'fail'
-        : robotsTxt.exists
-        ? 'pass'
-        : 'warn',
+        : 'pass',
     evidence:
       robotsTxt.exists === null
         ? robotsTxt.reason || 'robots.txt could not be checked'
@@ -671,16 +673,16 @@ export function buildAutomatedFindings(input: BuildAutomatedFindingsInput): Audi
         ? 'robots.txt contains blanket Disallow: /'
         : robotsTxt.exists
         ? 'robots.txt present and allows indexing'
-        : 'No robots.txt file (HTTP 404)',
+        : 'No robots.txt (crawlers are allowed by default)',
     fix:
       robotsTxt.allowsIndexing === false
         ? 'Remove the blanket "Disallow: /" rule in robots.txt so search engines can index your site.'
-        : 'Publish a clean /robots.txt referencing your sitemap.xml URL.',
+        : 'Keep crawlers allowed (optional: add a /robots.txt referencing your sitemap.xml URL).',
     businessImpact:
       robotsTxt.allowsIndexing === false
         ? 'A blanket Disallow rule hides your entire website from search results.'
-        : 'A clear robots.txt guides automated crawlers cleanly to your booking pages.',
-    weight: 4,
+        : 'Search engines can crawl and index your pages normally.',
+    weight: robotsTxt.allowsIndexing === false ? 5 : 1,
   });
 
   findings.push({
@@ -801,7 +803,7 @@ export function buildAutomatedFindings(input: BuildAutomatedFindingsInput): Audi
     fix: 'Wrap your main phone number in a clickable <a href="tel:..."> link in the header and footer.',
     businessImpact:
       'Mobile callers leave when they have to copy-paste or manually dial plain-text phone numbers.',
-    weight: 5,
+    weight: 3,
   });
 
   const waCount = parsed?.links.whatsapp.length ?? 0;
@@ -859,7 +861,7 @@ export function buildAutomatedFindings(input: BuildAutomatedFindingsInput): Audi
     fix: 'Embed a simple 3-field inquiry or direct booking widget so after-hours visitors can convert.',
     businessImpact:
       'Without an online form or booking path, overnight and weekend traffic turns into lost inquiries.',
-    weight: 5,
+    weight: 3,
   });
 
   // --- SOCIAL PROFILE LINKS ON SITE ---

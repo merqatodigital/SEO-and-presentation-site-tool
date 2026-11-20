@@ -18,6 +18,8 @@ import { buildValidatedJsonLd } from '../audit/jsonLd';
 import { AuditResult, ManualFootprint } from '../audit/types';
 import {
   AISearchLayerData,
+  CURRENCY_CONFIG,
+  CurrencyCode,
   FootprintNode,
   PricingTier,
   ProjectBrief,
@@ -25,6 +27,7 @@ import {
   RoadmapQuarterPlan,
   WalkthroughData,
   buildLlmsTxt,
+  getAddedPricingTierDefaults,
   getContrastTextColor,
 } from '../types/tour';
 
@@ -33,6 +36,7 @@ interface ProposalSectionProps {
   walkthrough: WalkthroughData;
   footprint: FootprintNode[];
   pricingTiers: PricingTier[];
+  currency: CurrencyCode;
   aiSearchLayer: AISearchLayerData;
   audit: AuditResult | null;
   manualFootprint: ManualFootprint;
@@ -41,6 +45,7 @@ interface ProposalSectionProps {
   onRoadmapChange: (roadmap: RoadmapQuarterPlan[]) => void;
   onFootprintChange: (footprint: FootprintNode[]) => void;
   onPricingChange: (tiers: PricingTier[]) => void;
+  onCurrencyChange: (currency: CurrencyCode) => void;
   onAISearchLayerChange: (next: AISearchLayerData) => void;
   onResetAISearchLayer: () => void;
   onExportJson: () => void;
@@ -59,6 +64,7 @@ export const ProposalSection: React.FC<ProposalSectionProps> = ({
   walkthrough,
   footprint,
   pricingTiers,
+  currency,
   aiSearchLayer,
   audit,
   manualFootprint,
@@ -67,6 +73,7 @@ export const ProposalSection: React.FC<ProposalSectionProps> = ({
   onRoadmapChange,
   onFootprintChange,
   onPricingChange,
+  onCurrencyChange,
   onAISearchLayerChange,
   onResetAISearchLayer,
   onExportJson,
@@ -201,14 +208,15 @@ export const ProposalSection: React.FC<ProposalSectionProps> = ({
 
   const addPricingTier = () => {
     if (pricingTiers.length >= 3) return;
+    const defaults = getAddedPricingTierDefaults(currency);
     onPricingChange([
       ...pricingTiers,
       {
         id: `tier-${Date.now()}`,
         name: 'Complete Digital Suite',
         audience: 'For established teams scaling regional reach',
-        setupPrice: '$6,500',
-        monthlyPrice: '$850',
+        setupPrice: defaults.setupPrice,
+        monthlyPrice: defaults.monthlyPrice,
         recommended: false,
         features: [
           'Full website & direct booking experience',
@@ -879,16 +887,34 @@ export const ProposalSection: React.FC<ProposalSectionProps> = ({
             </h3>
           </div>
 
-          {pricingTiers.length < 3 && (
-            <button
-              type="button"
-              onClick={addPricingTier}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              Add 3rd tier
-            </button>
-          )}
+          <div className="flex flex-wrap items-center gap-2.5">
+            <label className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-400">
+              <span>Currency</span>
+              <select
+                value={currency}
+                onChange={(e) => onCurrencyChange(e.target.value as CurrencyCode)}
+                aria-label="Pricing currency"
+                className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+              >
+                {(Object.keys(CURRENCY_CONFIG) as CurrencyCode[]).map((code) => (
+                  <option key={code} value={code}>
+                    {CURRENCY_CONFIG[code].label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {pricingTiers.length < 3 && (
+              <button
+                type="button"
+                onClick={addPricingTier}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Add 3rd tier
+              </button>
+            )}
+          </div>
         </div>
 
         <div

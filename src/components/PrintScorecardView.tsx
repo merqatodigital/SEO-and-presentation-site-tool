@@ -264,7 +264,8 @@ export const PrintScorecardView: React.FC<PrintScorecardViewProps> = ({
                       {' '}
                       · Est. revenue:{' '}
                       <strong className="text-slate-900">
-                        PHP {scorecard.ignoredLeads.revenueLostPhpLow.toLocaleString()}–
+                        {scorecard.ignoredLeads.currency ?? project.currency ?? 'PHP'}{' '}
+                        {scorecard.ignoredLeads.revenueLostPhpLow.toLocaleString()}–
                         {scorecard.ignoredLeads.revenueLostPhpHigh.toLocaleString()}
                       </strong>
                     </>

@@ -287,6 +287,11 @@ export const WalkthroughPlayer: React.FC<WalkthroughPlayerProps> = ({
                   <span>Audit evidence: {currentScene.findingRefs.join(', ')}</span>
                 </>
               )}
+              {currentScene.needsReview && (
+                <span className="rounded border border-amber-400/70 bg-amber-950/80 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200">
+                  Check numbers
+                </span>
+              )}
             </div>
             <p className="mt-1 text-lg font-semibold tracking-tight text-white sm:text-xl [text-wrap:balance]">
               {currentScene.caption}
@@ -389,6 +394,25 @@ export const WalkthroughPlayer: React.FC<WalkthroughPlayerProps> = ({
       {/* Inline Scene Editor Panel */}
       {editingScene && (
         <div className="mt-4 rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+          {currentScene.needsReview && (
+            <div className="mb-3 flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/60 dark:text-amber-200">
+              <div className="flex items-center gap-2">
+                <span className="rounded border border-amber-400 bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900 dark:border-amber-700 dark:bg-amber-900 dark:text-amber-100">
+                  Check numbers
+                </span>
+                <span>Verify any figures in this scene against your audit evidence.</span>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateScene(safeIndex, { ...currentScene, needsReview: false })
+                }
+                className="text-xs font-semibold underline underline-offset-4 hover:opacity-80 whitespace-nowrap"
+              >
+                Mark checked
+              </button>
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-12">
             <div className="md:col-span-5">
               <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
@@ -527,6 +551,11 @@ export const WalkthroughPlayer: React.FC<WalkthroughPlayerProps> = ({
                     </span>
                     <span aria-hidden="true">·</span>
                     <span>{dur.toFixed(1)}s</span>
+                    {scene.needsReview && (
+                      <span className="ml-auto rounded border border-amber-300 bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+                        Check numbers
+                      </span>
+                    )}
                   </div>
                   <p className="mt-0.5 line-clamp-2 text-xs font-medium leading-snug text-slate-800 dark:text-slate-200">
                     {scene.caption}

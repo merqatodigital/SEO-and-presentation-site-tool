@@ -27,7 +27,12 @@ import {
   RagBand,
   Scorecard,
 } from '../audit/types';
-import { ProjectBrief, getContrastTextColor } from '../types/tour';
+import {
+  CURRENCY_CONFIG,
+  CurrencyCode,
+  ProjectBrief,
+  getContrastTextColor,
+} from '../types/tour';
 import { ManualFootprintForm } from './ManualFootprintForm';
 import { ProspectsPanel } from './ProspectsPanel';
 
@@ -53,6 +58,7 @@ interface AuditSectionProps {
   onLoadSampleAudit: () => void;
   onManualFootprintChange: (next: ManualFootprint) => void;
   onAssumptionsChange: (next: AuditAssumptions) => void;
+  onCurrencyChange?: (currency: CurrencyCode) => void;
   onProspectsChange: (next: ProspectEntry[]) => void;
   onOpenProspectScorecard: (prospect: ProspectEntry) => void;
   onPromoteProspect: (prospect: ProspectEntry) => void;
@@ -134,12 +140,15 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
   onLoadSampleAudit,
   onManualFootprintChange,
   onAssumptionsChange,
+  onCurrencyChange,
   onProspectsChange,
   onOpenProspectScorecard,
   onPromoteProspect,
   onPrintScorecard,
   onExportAuditJson,
 }) => {
+  const activeCurrency: CurrencyCode =
+    assumptions.currency ?? project.currency ?? 'PHP';
   const [categoryFilter, setCategoryFilter] = useState<'all' | AuditCategoryId>('all');
   const [statusFilter, setStatusFilter] = useState<'all' | FindingStatus>('all');
   const [findingsSort, setFindingsSort] = useState<'weight' | 'status' | 'category'>('weight');
@@ -857,19 +866,40 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
               {/* Transparent Ignored-Leads Estimate */}
               <div className="lg:col-span-5">
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950">
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
                       &ldquo;Ignored Leads&rdquo; Assumptions
                     </h4>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onAssumptionsChange({ ...assumptions, monthlyVisitors: null })
-                      }
-                      className="text-xs font-medium text-slate-600 underline underline-offset-4 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
-                    >
-                      I don&apos;t know visitors
-                    </button>
+                    <div className="flex items-center gap-2.5">
+                      <select
+                        value={activeCurrency}
+                        onChange={(e) => {
+                          const next = e.target.value as CurrencyCode;
+                          if (onCurrencyChange) {
+                            onCurrencyChange(next);
+                          } else {
+                            onAssumptionsChange({ ...assumptions, currency: next });
+                          }
+                        }}
+                        aria-label="Select currency"
+                        className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+                      >
+                        {(Object.keys(CURRENCY_CONFIG) as CurrencyCode[]).map((code) => (
+                          <option key={code} value={code}>
+                            {CURRENCY_CONFIG[code].label}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onAssumptionsChange({ ...assumptions, monthlyVisitors: null })
+                        }
+                        className="text-xs font-medium text-slate-600 underline underline-offset-4 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
+                      >
+                        I don&apos;t know visitors
+                      </button>
+                    </div>
                   </div>
 
                   <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -915,7 +945,7 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
 
                     <div>
                       <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                        Avg Booking Value (PHP)
+                        Avg Booking Value ({activeCurrency})
                       </label>
                       <input
                         type="number"
@@ -1017,7 +1047,7 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
                       {scorecard.ignoredLeads.revenueLostPhpLow !== null &&
                         scorecard.ignoredLeads.revenueLostPhpHigh !== null && (
                           <p className="mt-0.5 text-sm font-semibold text-slate-700 tabular-nums dark:text-slate-300">
-                            PHP {scorecard.ignoredLeads.revenueLostPhpLow.toLocaleString()} –{' '}
+                            {activeCurrency} {scorecard.ignoredLeads.revenueLostPhpLow.toLocaleString()} –{' '}
                             {scorecard.ignoredLeads.revenueLostPhpHigh.toLocaleString()} / mo
                           </p>
                         )}

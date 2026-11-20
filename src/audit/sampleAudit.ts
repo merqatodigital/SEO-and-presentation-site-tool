@@ -171,6 +171,7 @@ export function buildSampleAudit(): {
   manual.priceRange = '$$';
 
   const assumptions: AuditAssumptions = {
+    currency: 'PHP',
     monthlyVisitors: 900,
     inquiryRatePct: 2,
     avgBookingValuePhp: 3500,

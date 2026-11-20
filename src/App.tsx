@@ -30,6 +30,7 @@ import {
   AISearchLayerData,
   AISettings,
   CURRENT_BUNDLE_SCHEMA_VERSION,
+  CurrencyCode,
   DEFAULT_AI_SETTINGS,
   DEFAULT_FOOTPRINT,
   DEFAULT_PRICING_TIERS,
@@ -44,6 +45,7 @@ import {
   WalkthroughData,
   WalkthroughScene,
   buildDefaultAISearchLayer,
+  convertPricingTiersCurrency,
   createWalkthroughSchema,
 } from './types/tour';
 
@@ -59,6 +61,7 @@ const EMPTY_PROJECT: ProjectBrief = {
   brandColor: '#0F766E',
   logoDataUrl: null,
   websiteUrl: '',
+  currency: 'PHP',
 };
 
 function loadInitialSettings(): AISettings {
@@ -452,6 +455,11 @@ export default function App() {
               migrated.audit?.finalUrl ||
               migrated.audit?.requestedUrl ||
               project.websiteUrl,
+            currency:
+              migrated.project.currency ||
+              migrated.assumptions?.currency ||
+              project.currency ||
+              'PHP',
           }
         : project;
 
@@ -558,6 +566,15 @@ export default function App() {
 
   const handleTitleChange = (title: string) => {
     setWalkthrough((prev) => (prev ? { ...prev, title } : prev));
+  };
+
+  const activeCurrency: CurrencyCode =
+    assumptions.currency ?? project.currency ?? 'PHP';
+
+  const handleCurrencyChange = (nextCurrency: CurrencyCode) => {
+    setProject((prev) => ({ ...prev, currency: nextCurrency }));
+    setAssumptions((prev) => ({ ...prev, currency: nextCurrency }));
+    setPricingTiers((prev) => convertPricingTiersCurrency(prev, nextCurrency));
   };
 
   const showPrintableLayer = Boolean(walkthrough || audit || scorecard.knownChecks > 0);
@@ -672,6 +689,7 @@ export default function App() {
           onLoadSampleAudit={handleLoadSampleAudit}
           onManualFootprintChange={setManualFootprint}
           onAssumptionsChange={setAssumptions}
+          onCurrencyChange={handleCurrencyChange}
           onProspectsChange={setProspects}
           onOpenProspectScorecard={handleOpenProspectScorecard}
           onPromoteProspect={handlePromoteProspect}
@@ -693,6 +711,7 @@ export default function App() {
               walkthrough={walkthrough}
               footprint={footprint}
               pricingTiers={pricingTiers}
+              currency={activeCurrency}
               aiSearchLayer={aiSearchLayer}
               audit={audit}
               manualFootprint={manualFootprint}
@@ -701,6 +720,7 @@ export default function App() {
               onRoadmapChange={handleRoadmapChange}
               onFootprintChange={setFootprint}
               onPricingChange={setPricingTiers}
+              onCurrencyChange={handleCurrencyChange}
               onAISearchLayerChange={setAiSearchLayer}
               onResetAISearchLayer={() =>
                 setAiSearchLayer(buildDefaultAISearchLayer(project, pageFacts, walkthrough))

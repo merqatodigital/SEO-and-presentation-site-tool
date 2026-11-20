@@ -39,7 +39,15 @@ import {
 } from './scorecard';
 import { buildValidatedJsonLd, selectJsonLdBusinessType } from './jsonLd';
 import { migrateImportedBundle } from './bundleMigration';
-import { createWalkthroughSchema } from '../types/tour';
+import {
+  DEFAULT_AI_SETTINGS,
+  DEFAULT_PRICING_TIERS,
+  WalkthroughData,
+  buildDefaultPricingTiers,
+  convertPricingTiersCurrency,
+  createWalkthroughSchema,
+} from '../types/tour';
+import { generateWalkthrough, validateNumbersGrounded } from '../lib/aiClient';
 import {
   SlidingWindowRateLimiter,
   SsrfBlockedError,
@@ -129,11 +137,14 @@ test('RAG and letter grade boundaries match specification', () => {
   assert.equal(getRagBand(49), 'red');
   assert.equal(getRagBand(null), 'unknown');
 
-  assert.equal(getLetterGrade(85), 'A');
-  assert.equal(getLetterGrade(70), 'B');
-  assert.equal(getLetterGrade(55), 'C');
-  assert.equal(getLetterGrade(40), 'D');
-  assert.equal(getLetterGrade(39), 'F');
+  assert.equal(getLetterGrade(90), 'A');
+  assert.equal(getLetterGrade(89), 'B');
+  assert.equal(getLetterGrade(80), 'B');
+  assert.equal(getLetterGrade(79), 'C');
+  assert.equal(getLetterGrade(65), 'C');
+  assert.equal(getLetterGrade(64), 'D');
+  assert.equal(getLetterGrade(50), 'D');
+  assert.equal(getLetterGrade(49), 'F');
   assert.equal(getLetterGrade(null), 'N/A');
 });
 
@@ -535,8 +546,9 @@ test('PATCH: <50% measured category shows Insufficient data and is excluded from
   assert.equal(card.isProvisional, true);
 
   const outreach = buildOutreachSummary('Example Island Resort', 'https://example-resort.ph', card);
-  assert.ok(outreach.includes('[Provisional]'));
-  assert.ok(outreach.includes('Add Google Business Profile data for a final grade.'));
+  assert.equal(outreach.includes('[Provisional]'), false);
+  assert.equal(outreach.includes('Add Google Business Profile data for a final grade.'), false);
+  assert.ok(outreach.includes('50/100 (preliminary, based on your public website)'));
 });
 
 test('PATCH: TTFB thresholds (<=800 pass, <=1800 warn, >1800 fail) and expanded CTA & client name rules', () => {
@@ -1023,6 +1035,191 @@ test('BATCH 3: audit overall deadline returns partial results with timeout note,
     (err: unknown) => err instanceof AuditJobSkippedError
   );
 });
+
+test('BATCH 4: seo-robots, contact weights, speed-images-alt category, and CTA_PATTERN ignore/length rules', () => {
+  const html = `<!doctype html>
+  <html lang="en">
+    <head><title>Island Sanctuary & Eco Tours</title></head>
+    <body>
+      <a href="/sanctuary">Nature Reserve</a>
+      <a href="/marine-park">Marine Reserve</a>
+      <a href="/info">Availability of fresh seasonal fruit daily</a>
+      <a href="/this-is-too-long">Book your unforgettable luxury island resort getaway package with transfers today</a>
+      <a href="/book">Reserve now</a>
+      <button>Check availability</button>
+      <a href="https://wa.me/639171234567">Chat with our front desk reservations specialist now</a>
+    </body>
+  </html>`;
+
+  const parsed = parseHtmlWithCheerio(html);
+  assert.equal(parsed.ctaTexts.includes('Nature Reserve'), false);
+  assert.equal(parsed.ctaTexts.includes('Marine Reserve'), false);
+  assert.equal(parsed.ctaTexts.some((t) => /availability of/i.test(t)), false);
+  assert.equal(parsed.ctaTexts.some((t) => t.startsWith('Book your unforgettable')), false);
+  assert.equal(parsed.ctaTexts.includes('Reserve now'), true);
+  assert.equal(parsed.ctaTexts.includes('Check availability'), true);
+  assert.equal(
+    parsed.ctaTexts.includes('Chat with our front desk reservations specialist now'),
+    true
+  );
+
+  const noRobotsFindings = buildAutomatedFindings({
+    isHttps: true,
+    fetchError: null,
+    ttfbMs: 320,
+    ttfbSampleCount: 3,
+    parsed,
+    robotsTxt: { exists: false, allowsIndexing: true },
+    sitemapXml: { exists: true },
+    speed: null,
+    speedReason: 'Skipped',
+  });
+
+  const robotsMissing = noRobotsFindings.find((f) => f.id === 'seo-robots');
+  assert.equal(robotsMissing?.status, 'pass');
+  assert.equal(robotsMissing?.evidence, 'No robots.txt (crawlers are allowed by default)');
+  assert.equal(robotsMissing?.weight, 1);
+
+  const imagesAlt = noRobotsFindings.find((f) => f.id === 'speed-images-alt');
+  assert.equal(imagesAlt?.category, 'seo');
+
+  assert.equal(noRobotsFindings.find((f) => f.id === 'contact-tel')?.weight, 3);
+  assert.equal(noRobotsFindings.find((f) => f.id === 'contact-messaging')?.weight, 5);
+  assert.equal(noRobotsFindings.find((f) => f.id === 'contact-booking-cta')?.weight, 5);
+  assert.equal(noRobotsFindings.find((f) => f.id === 'contact-form-or-booking')?.weight, 3);
+
+  const disallowRobots = buildAutomatedFindings({
+    isHttps: true,
+    fetchError: null,
+    ttfbMs: 320,
+    ttfbSampleCount: 3,
+    parsed,
+    robotsTxt: { exists: true, allowsIndexing: false },
+    sitemapXml: { exists: true },
+    speed: null,
+    speedReason: 'Skipped',
+  }).find((f) => f.id === 'seo-robots');
+  assert.equal(disallowRobots?.status, 'fail');
+  assert.equal(disallowRobots?.weight, 5);
+});
+
+test('BATCH 4: validateNumbersGrounded and generateWalkthrough retry + needsReview fallback', async () => {
+  const groundedOutput: WalkthroughData = {
+    title: 'Faster Bookings for El Nido Resort',
+    scenes: [
+      {
+        screenshotIndex: 0,
+        caption: 'Cut slow 4.8s load delays on mobile',
+        narration:
+          'Visitors see your main offer right away instead of waiting 4.8 s on 1,250 ms servers, ready for Q1 through Q4 growth in 2027.',
+        highlight: { x: 10, y: 10, w: 40, h: 20 },
+        findingRefs: ['speed-lcp'],
+      },
+    ],
+    outcomes: [
+      {
+        title: 'Faster First Impression',
+        description: 'Shave off the 4.8s mobile wait and keep 24-hour inquiries moving through 2027.',
+        findingRef: 'speed-lcp',
+      },
+    ],
+    roadmap: [
+      { quarter: 'Q1', items: ['Speed up hero image'] },
+      { quarter: 'Q2', items: ['Add direct booking link'] },
+      { quarter: 'Q3', items: ['Collect reviews'] },
+      { quarter: 'Q4', items: ['Scale direct revenue'] },
+    ],
+  };
+
+  const allowedText = [
+    'LCP 4.8 s',
+    'Median TTFB 1250 ms (3 requests)',
+    'We run a 24-hour front desk in Palawan.',
+  ].join('\n');
+
+  const ok = validateNumbersGrounded(groundedOutput, allowedText);
+  assert.equal(ok.valid, true);
+  assert.deepEqual(ok.violations, []);
+
+  const ungroundedOutput: WalkthroughData = {
+    ...groundedOutput,
+    scenes: [
+      {
+        ...groundedOutput.scenes[0],
+        caption: 'Boost bookings by 47% right away',
+        narration: 'Reduce mobile wait times from 3.2 s and capture 3x more leads into 2027.',
+      },
+    ],
+  };
+
+  const bad = validateNumbersGrounded(ungroundedOutput, allowedText);
+  assert.equal(bad.valid, false);
+  assert.deepEqual(bad.offendingSceneIndices, [0]);
+  assert.equal(bad.violations.some((v) => v.token === '47%'), true);
+  assert.equal(bad.violations.some((v) => v.token === '3.2 s'), true);
+
+  // Test generateWalkthrough: retry receives violations, and if still ungrounded, keeps result with needsReview
+  let callCount = 0;
+  let retryPromptSawViolation = false;
+  const result = await generateWalkthrough({
+    settings: { ...DEFAULT_AI_SETTINGS, apiKey: 'test', model: 'test-vision' },
+    project: {
+      clientName: 'El Nido Resort',
+      businessType: 'Resort',
+      brief: 'We run a 24-hour front desk in Palawan.',
+      brandColor: '#0F766E',
+      logoDataUrl: null,
+    },
+    screenshots: [
+      { id: 's1', name: 'home.png', dataUrl: 'data:image/png;base64,AA==', width: 1280, height: 760 },
+    ],
+    findings: [
+      {
+        id: 'speed-lcp',
+        category: 'speed',
+        label: 'Main content load time (LCP)',
+        status: 'fail',
+        evidence: 'LCP 4.8 s',
+        fix: 'Optimize hero',
+        businessImpact: 'Visitors leave',
+        weight: 5,
+      },
+    ],
+    completeChat: async (messages) => {
+      callCount++;
+      if (callCount === 2) {
+        const lastUserText = String(messages[messages.length - 1]?.content ?? '');
+        retryPromptSawViolation = lastUserText.includes('47%');
+      }
+      return JSON.stringify(ungroundedOutput);
+    },
+  });
+
+  assert.equal(callCount, 2);
+  assert.equal(retryPromptSawViolation, true);
+  assert.equal(result.scenes[0]?.needsReview, true);
+});
+
+test('CURRENCY: Philippine Peso (PHP) is default with USD and EUR options', () => {
+  const defaultAssumptions = createDefaultAssumptions();
+  assert.equal(defaultAssumptions.currency, 'PHP');
+
+  assert.ok(DEFAULT_PRICING_TIERS[0].setupPrice.startsWith('₱'));
+  const usdTiers = convertPricingTiersCurrency(DEFAULT_PRICING_TIERS, 'USD');
+  assert.equal(usdTiers[0].setupPrice, '$2,400');
+  const eurTiers = convertPricingTiersCurrency(DEFAULT_PRICING_TIERS, 'EUR');
+  assert.equal(eurTiers[0].setupPrice, '€2,200');
+  assert.deepEqual(eurTiers, buildDefaultPricingTiers('EUR'));
+
+  const estimateUsd = computeIgnoredLeadsEstimate([], createEmptyManualFootprint(), {
+    ...defaultAssumptions,
+    currency: 'USD',
+    monthlyVisitors: 500,
+    avgBookingValuePhp: 200,
+  });
+  assert.equal(estimateUsd.currency, 'USD');
+});
+
 
 
 

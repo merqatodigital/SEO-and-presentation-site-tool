@@ -277,6 +277,7 @@ export function createEmptyManualFootprint(): ManualFootprint {
 }
 
 export const AuditAssumptionsSchema = z.object({
+  currency: z.enum(['PHP', 'USD', 'EUR']).optional().default('PHP'),
   monthlyVisitors: z.number().nullable().default(null),
   inquiryRatePct: z.number().min(0).max(100).default(2),
   avgBookingValuePhp: z.number().nullable().default(null),
@@ -288,6 +289,7 @@ export type AuditAssumptions = z.infer<typeof AuditAssumptionsSchema>;
 
 export function createDefaultAssumptions(): AuditAssumptions {
   return {
+    currency: 'PHP',
     monthlyVisitors: null,
     inquiryRatePct: 2,
     avgBookingValuePhp: null,
@@ -315,6 +317,7 @@ export type CategoryScore = z.infer<typeof CategoryScoreSchema>;
 
 export const IgnoredLeadsEstimateSchema = z.object({
   visible: z.boolean(),
+  currency: z.enum(['PHP', 'USD', 'EUR']).optional().default('PHP'),
   monthlyVisitors: z.number().nullable(),
   inquiryRatePct: z.number(),
   avgBookingValuePhp: z.number().nullable(),

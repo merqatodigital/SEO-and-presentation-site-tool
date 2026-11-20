@@ -106,6 +106,13 @@ export function buildSampleAudit(): {
     htmlBytes: 48200,
     isHttps: true,
     fetchError: null,
+    contentSource: 'raw',
+    auditNotes: [
+      {
+        code: 'sample',
+        message: 'Sample audit data is loaded offline; run a live audit on any public URL to test a real site.',
+      },
+    ],
     parsed,
     robotsTxt,
     sitemapXml,

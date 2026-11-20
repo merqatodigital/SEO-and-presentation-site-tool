@@ -154,6 +154,9 @@ export async function captureWebsite({
         ? (parsedBody as { error: string }).error
         : rawText || response.statusText;
 
+    if (/No Chromium found/i.test(serverErr)) {
+      throw new Error(serverErr);
+    }
     if (response.status === 401) {
       throw new Error(
         `Capture server rejected authentication (401). Check your Capture token in Settings. ${serverErr}`

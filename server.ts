@@ -3,48 +3,99 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { chromium } from 'playwright-core';
 import {
-  SsrfBlockedError,
+  AuditQueueFullError,
   enqueueAudit,
   resolveChromiumExecutable,
-  validatePublicTargetUrl,
 } from './serverAudit.ts';
+import {
+  CHROME_USER_AGENT,
+  CHROMIUM_FLAGS,
+  SlidingWindowRateLimiter,
+  SsrfBlockedError,
+  attachPublicUrlRouteFilter,
+  isAllowedRelayHost,
+  parseAllowedRelayHosts,
+  requireCaptureToken,
+  sendTargetUrlError,
+  validatePublicTargetUrl,
+} from './serverShared.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 const CAPTURE_TOKEN = process.env.CAPTURE_TOKEN?.trim() || '';
+const TRUST_PROXY = process.env.TRUST_PROXY?.trim().toLowerCase() === 'true';
+const RELAY_ALLOWED_HOSTS = parseAllowedRelayHosts(process.env.RELAY_ALLOWED_HOSTS);
 
-// Per-IP sliding-window rate limiter for POST /api/audit (max 10 requests / 60s)
-const AUDIT_RATE_WINDOW_MS = 60_000;
 const AUDIT_RATE_MAX = 10;
-const auditRateMap = new Map<string, number[]>();
+const CAPTURE_RATE_MAX = 5;
+const RELAY_RATE_MAX = 60;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+const RELAY_TIMEOUT_MS = 60_000;
+const RELAY_MAX_BYTES = 2 * 1024 * 1024;
+const CAPTURE_CONCURRENCY_MAX = 2;
+const CAPTURE_HARD_DEADLINE_MS = 45_000;
+
+const rateLimiter = new SlidingWindowRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  maxKeys: 10_000,
+});
+setInterval(() => {
+  rateLimiter.prune();
+}, RATE_LIMIT_WINDOW_MS).unref();
 
 function getClientIp(req: express.Request): string {
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.trim()) {
-    return fwd.split(',')[0].trim();
+  if (TRUST_PROXY) {
+    return req.ip || req.socket.remoteAddress || 'unknown';
   }
-  return req.ip || req.socket.remoteAddress || 'unknown';
+  return req.socket.remoteAddress || 'unknown';
 }
 
-function checkAuditRateLimit(ip: string): boolean {
-  const now = Date.now();
-  const prev = auditRateMap.get(ip) || [];
-  const fresh = prev.filter((ts) => now - ts < AUDIT_RATE_WINDOW_MS);
-  if (fresh.length >= AUDIT_RATE_MAX) {
-    auditRateMap.set(ip, fresh);
-    return false;
-  }
-  fresh.push(now);
-  auditRateMap.set(ip, fresh);
-  return true;
+function isAllowedRelayContentType(rawContentType: string | null): boolean {
+  if (!rawContentType) return true;
+  const mediaType = rawContentType.split(';')[0].trim().toLowerCase();
+  if (!mediaType) return true;
+  return (
+    mediaType === 'application/json' ||
+    mediaType.endsWith('+json') ||
+    mediaType === 'text/event-stream'
+  );
 }
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+if (TRUST_PROXY) {
+  app.set('trust proxy', 1);
+}
 
-app.post('/api/relay', async (req, res) => {
+const smallJsonParser = express.json({ limit: '64kb' });
+const relayJsonParser = express.json({ limit: '25mb' });
+
+let activeCaptureCount = 0;
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    chromium: resolveChromiumExecutable(),
+    node: process.version,
+    uptime: Math.floor(process.uptime()),
+  });
+});
+
+app.post('/api/relay', relayJsonParser, async (req, res) => {
+  if (!requireCaptureToken(req, res, CAPTURE_TOKEN)) {
+    return;
+  }
+
+  const clientIp = getClientIp(req);
+  if (!rateLimiter.check(`relay:${clientIp}`, RELAY_RATE_MAX)) {
+    res.status(429).json({
+      error: 'Rate limit exceeded (60 relay requests per minute). Please wait a moment and retry.',
+    });
+    return;
+  }
+
   const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   const method = req.body?.method === 'GET' ? 'GET' : 'POST';
   const apiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : '';
@@ -59,16 +110,19 @@ app.post('/api/relay', async (req, res) => {
   try {
     targetUrl = await validatePublicTargetUrl(rawUrl);
   } catch (err) {
-    const status =
-      err && typeof err === 'object' && 'statusCode' in err
-        ? Number((err as { statusCode: number }).statusCode)
-        : 400;
-    res.status(status).json({ error: err instanceof Error ? err.message : 'Blocked URL.' });
+    sendTargetUrlError(res, err);
     return;
   }
 
   if (targetUrl.protocol !== 'https:') {
     res.status(403).json({ error: 'Relay only allows HTTPS external API endpoints.' });
+    return;
+  }
+
+  if (!isAllowedRelayHost(targetUrl.hostname, RELAY_ALLOWED_HOSTS)) {
+    res.status(403).json({
+      error: `Relay target host "${targetUrl.hostname}" is not in RELAY_ALLOWED_HOSTS.`,
+    });
     return;
   }
 
@@ -82,35 +136,78 @@ app.post('/api/relay', async (req, res) => {
     headers.Authorization = `Bearer ${apiKey}`;
   }
 
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), RELAY_TIMEOUT_MS);
+
   try {
     const upstream = await fetch(targetUrl.toString(), {
       method,
       headers,
       redirect: 'manual',
+      signal: controller.signal,
       body: method === 'POST' ? JSON.stringify(payload ?? {}) : undefined,
     });
-    const text = await upstream.text();
+
+    if (upstream.status >= 300 && upstream.status < 400) {
+      await upstream.body?.cancel().catch(() => {});
+      res.status(502).json({ error: 'Upstream AI endpoint returned an unexpected redirect.' });
+      return;
+    }
+
+    const upstreamContentType = upstream.headers.get('content-type');
+    if (!isAllowedRelayContentType(upstreamContentType)) {
+      await upstream.body?.cancel().catch(() => {});
+      res.status(502).json({ error: 'Upstream AI returned an unsupported content type.' });
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+
+    if (upstream.body) {
+      const reader = upstream.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > RELAY_MAX_BYTES) {
+          await reader.cancel().catch(() => {});
+          controller.abort();
+          res.status(502).json({ error: 'Upstream AI response exceeded 2 MB limit.' });
+          return;
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+
+    const bodyText = Buffer.concat(chunks).toString('utf8');
     res.status(upstream.status);
-    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/json');
-    res.send(text);
+    res.setHeader(
+      'Content-Type',
+      upstreamContentType?.split(';')[0].trim() || 'application/json'
+    );
+    res.send(bodyText);
   } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      res.status(504).json({ error: 'Upstream AI provider timed out after 60s.' });
+      return;
+    }
     res.status(502).json({
       error: err instanceof Error ? err.message : 'Unable to reach upstream AI provider.',
     });
+  } finally {
+    clearTimeout(timeoutHandle);
   }
 });
 
-app.post('/api/audit', async (req, res) => {
-  if (CAPTURE_TOKEN) {
-    const authHeader = req.headers.authorization || '';
-    if (authHeader !== `Bearer ${CAPTURE_TOKEN}`) {
-      res.status(401).json({ error: 'Invalid or missing capture bearer token.' });
-      return;
-    }
+app.post('/api/audit', smallJsonParser, async (req, res) => {
+  if (!requireCaptureToken(req, res, CAPTURE_TOKEN)) {
+    return;
   }
 
   const clientIp = getClientIp(req);
-  if (!checkAuditRateLimit(clientIp)) {
+  if (!rateLimiter.check(`audit:${clientIp}`, AUDIT_RATE_MAX)) {
     res.status(429).json({
       error: 'Rate limit exceeded (10 audits per minute). Please wait a moment and retry.',
     });
@@ -123,31 +220,35 @@ app.post('/api/audit', async (req, res) => {
     return;
   }
 
+  const executablePath = resolveChromiumExecutable();
+  if (!executablePath) {
+    res.status(503).json({ error: 'No Chromium found. Set PLAYWRIGHT_EXECUTABLE_PATH.' });
+    return;
+  }
+
   try {
     const result = await enqueueAudit(rawUrl);
     res.json(result);
   } catch (err) {
-    if (err instanceof SsrfBlockedError) {
-      res.status(err.statusCode).json({ error: err.message });
+    if (err instanceof AuditQueueFullError) {
+      res.status(503).json({ error: err.message });
       return;
     }
-    const status =
-      err && typeof err === 'object' && 'statusCode' in err
-        ? Number((err as { statusCode: number }).statusCode)
-        : 400;
-    res.status(status).json({
-      error: err instanceof Error ? err.message : 'Invalid audit request.',
-    });
+    sendTargetUrlError(res, err);
   }
 });
 
-app.post('/api/capture', async (req, res) => {
-  if (CAPTURE_TOKEN) {
-    const authHeader = req.headers.authorization || '';
-    if (authHeader !== `Bearer ${CAPTURE_TOKEN}`) {
-      res.status(401).json({ error: 'Invalid or missing capture bearer token.' });
-      return;
-    }
+app.post('/api/capture', smallJsonParser, async (req, res) => {
+  if (!requireCaptureToken(req, res, CAPTURE_TOKEN)) {
+    return;
+  }
+
+  const clientIp = getClientIp(req);
+  if (!rateLimiter.check(`capture:${clientIp}`, CAPTURE_RATE_MAX)) {
+    res.status(429).json({
+      error: 'Rate limit exceeded (5 captures per minute). Please wait a moment and retry.',
+    });
+    return;
   }
 
   const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
@@ -165,197 +266,267 @@ app.post('/api/capture', async (req, res) => {
   try {
     targetUrl = await validatePublicTargetUrl(rawUrl);
   } catch (err) {
-    const status =
-      err && typeof err === 'object' && 'statusCode' in err
-        ? Number((err as { statusCode: number }).statusCode)
-        : 400;
-    res.status(status).json({ error: err instanceof Error ? err.message : 'Blocked URL.' });
+    sendTargetUrlError(res, err);
     return;
   }
 
+  const executablePath = resolveChromiumExecutable();
+  if (!executablePath) {
+    res.status(503).json({ error: 'No Chromium found. Set PLAYWRIGHT_EXECUTABLE_PATH.' });
+    return;
+  }
+
+  if (activeCaptureCount >= CAPTURE_CONCURRENCY_MAX) {
+    res.status(503).json({ error: 'Capture queue is full, try again in a minute.' });
+    return;
+  }
+
+  activeCaptureCount++;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  let deadlineHandle: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
+
+  const closeBrowserSafely = async () => {
+    const active = browser;
+    browser = null;
+    if (active) {
+      await active.close().catch(() => {});
+    }
+  };
 
   try {
-    const executablePath = resolveChromiumExecutable();
-    browser = await chromium.launch({
-      executablePath,
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-      ],
+    const deadlinePromise = new Promise<never>((_, reject) => {
+      deadlineHandle = setTimeout(() => {
+        timedOut = true;
+        void closeBrowserSafely();
+        reject(new Error('Capture timed out after 45 seconds.'));
+      }, CAPTURE_HARD_DEADLINE_MS);
     });
 
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      deviceScaleFactor: 1,
-      userAgent:
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    });
+    const captureWork = async () => {
+      browser = await chromium.launch({
+        executablePath,
+        headless: true,
+        args: [...CHROMIUM_FLAGS],
+      });
 
-    const page = await context.newPage();
+      const context = await browser.newContext({
+        viewport: { width: 1280, height: 800 },
+        deviceScaleFactor: 1,
+        userAgent: CHROME_USER_AGENT,
+      });
 
-    const response = await page.goto(targetUrl.toString(), {
-      waitUntil: 'domcontentloaded',
-      timeout: 25000,
-    });
+      const page = await context.newPage();
 
-    // Re-validate final URL after redirects to guard against SSRF redirect chains
-    await validatePublicTargetUrl(page.url());
+      const routeFilter = await attachPublicUrlRouteFilter(page);
 
-    if (response && response.status() >= 400) {
-      if (response.status() === 403 || response.status() === 401) {
-        res.status(403).json({
-          error: `Target website blocked automated access (HTTP ${response.status()}). Upload screenshots manually below instead.`,
+      const response = await page.goto(targetUrl.toString(), {
+        waitUntil: 'domcontentloaded',
+        timeout: 25000,
+      });
+
+      const blockedNavigationError = routeFilter.getBlockedNavigationError();
+      if (blockedNavigationError) {
+        throw new SsrfBlockedError(blockedNavigationError, 403);
+      }
+
+      // Re-validate final URL after redirects to guard against SSRF redirect chains
+      await validatePublicTargetUrl(page.url());
+
+      if (response && response.status() >= 400) {
+        if (response.status() === 403 || response.status() === 401) {
+          return {
+            status: 403 as const,
+            body: {
+              error: `Target website blocked automated access (HTTP ${response.status()}). Upload screenshots manually below instead.`,
+            },
+          };
+        }
+        if (response.status() === 404) {
+          return {
+            status: 422 as const,
+            body: { error: 'Website page not found (HTTP 404). Check the URL.' },
+          };
+        }
+      }
+
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(800);
+
+      const facts = await page.evaluate(() => {
+        const title = (document.title || '').trim();
+        const metaDesc =
+          document.querySelector('meta[name="description"]')?.getAttribute('content') ||
+          document.querySelector('meta[property="og:description"]')?.getAttribute('content') ||
+          '';
+
+        const headings: string[] = [];
+        const seenHeadings = new Set<string>();
+        for (const el of Array.from(document.querySelectorAll('h1, h2, h3'))) {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          if (
+            rect.width <= 0 ||
+            rect.height <= 0 ||
+            style.visibility === 'hidden' ||
+            style.display === 'none'
+          ) {
+            continue;
+          }
+          const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text.length >= 2 && text.length <= 140 && !seenHeadings.has(text)) {
+            seenHeadings.add(text);
+            headings.push(text);
+            if (headings.length >= 16) break;
+          }
+        }
+
+        const ctas: string[] = [];
+        const seenCtas = new Set<string>();
+        for (const el of Array.from(
+          document.querySelectorAll('button, a[href], [role="button"], input[type="submit"]')
+        )) {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          if (
+            rect.width <= 0 ||
+            rect.height <= 0 ||
+            style.visibility === 'hidden' ||
+            style.display === 'none'
+          ) {
+            continue;
+          }
+          const raw =
+            el instanceof HTMLInputElement
+              ? el.value
+              : el.textContent || el.getAttribute('aria-label') || '';
+          const text = raw.replace(/\s+/g, ' ').trim();
+          if (text.length >= 2 && text.length <= 55 && !seenCtas.has(text)) {
+            seenCtas.add(text);
+            ctas.push(text);
+            if (ctas.length >= 16) break;
+          }
+        }
+
+        const scrollHeight = Math.max(
+          document.body?.scrollHeight || 0,
+          document.documentElement?.scrollHeight || 0,
+          800
+        );
+
+        return {
+          title,
+          description: metaDesc.replace(/\s+/g, ' ').trim(),
+          headings,
+          ctas,
+          scrollHeight,
+          viewportHeight: window.innerHeight || 800,
+        };
+      });
+
+      const maxScroll = Math.max(0, facts.scrollHeight - facts.viewportHeight);
+      const scrollPositions: number[] = [];
+
+      if (maxScroll < 120) {
+        scrollPositions.push(0, 0, 0);
+      } else {
+        for (let i = 0; i < shotCount; i++) {
+          const ratio = shotCount === 1 ? 0 : i / (shotCount - 1);
+          scrollPositions.push(Math.round(maxScroll * ratio));
+        }
+      }
+
+      const sectionLabels = [
+        '01-hero.jpg',
+        '02-overview.jpg',
+        '03-sections.jpg',
+        '04-details.jpg',
+        '05-footer.jpg',
+        '06-extra.jpg',
+      ];
+      const shots: Array<{ name: string; dataUrl: string }> = [];
+
+      for (let i = 0; i < scrollPositions.length; i++) {
+        const y = scrollPositions[i];
+        await page.evaluate((scrollY) => window.scrollTo({ top: scrollY, behavior: 'instant' }), y);
+        await page.waitForTimeout(350);
+        const buffer = await page.screenshot({
+          type: 'jpeg',
+          quality: 82,
         });
-        return;
+        shots.push({
+          name: sectionLabels[i] || `0${i + 1}-section.jpg`,
+          dataUrl: `data:image/jpeg;base64,${buffer.toString('base64')}`,
+        });
       }
-      if (response.status() === 404) {
-        res.status(422).json({ error: `Website page not found (HTTP 404). Check the URL.` });
-        return;
-      }
-    }
-
-    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
-    await page.waitForTimeout(800);
-
-    const facts = await page.evaluate(() => {
-      const title = (document.title || '').trim();
-      const metaDesc =
-        document.querySelector('meta[name="description"]')?.getAttribute('content') ||
-        document.querySelector('meta[property="og:description"]')?.getAttribute('content') ||
-        '';
-
-      const headings: string[] = [];
-      const seenHeadings = new Set<string>();
-      for (const el of Array.from(document.querySelectorAll('h1, h2, h3'))) {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        if (
-          rect.width <= 0 ||
-          rect.height <= 0 ||
-          style.visibility === 'hidden' ||
-          style.display === 'none'
-        ) {
-          continue;
-        }
-        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (text.length >= 2 && text.length <= 140 && !seenHeadings.has(text)) {
-          seenHeadings.add(text);
-          headings.push(text);
-          if (headings.length >= 16) break;
-        }
-      }
-
-      const ctas: string[] = [];
-      const seenCtas = new Set<string>();
-      for (const el of Array.from(
-        document.querySelectorAll('button, a[href], [role="button"], input[type="submit"]')
-      )) {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        if (
-          rect.width <= 0 ||
-          rect.height <= 0 ||
-          style.visibility === 'hidden' ||
-          style.display === 'none'
-        ) {
-          continue;
-        }
-        const raw =
-          el instanceof HTMLInputElement
-            ? el.value
-            : el.textContent || el.getAttribute('aria-label') || '';
-        const text = raw.replace(/\s+/g, ' ').trim();
-        if (text.length >= 2 && text.length <= 55 && !seenCtas.has(text)) {
-          seenCtas.add(text);
-          ctas.push(text);
-          if (ctas.length >= 16) break;
-        }
-      }
-
-      const scrollHeight = Math.max(
-        document.body?.scrollHeight || 0,
-        document.documentElement?.scrollHeight || 0,
-        800
-      );
 
       return {
-        title,
-        description: metaDesc.replace(/\s+/g, ' ').trim(),
-        headings,
-        ctas,
-        scrollHeight,
-        viewportHeight: window.innerHeight || 800,
+        status: 200 as const,
+        body: {
+          title: facts.title,
+          description: facts.description,
+          headings: facts.headings,
+          ctas: facts.ctas,
+          shots,
+        },
       };
-    });
+    };
 
-    const maxScroll = Math.max(0, facts.scrollHeight - facts.viewportHeight);
-    const scrollPositions: number[] = [];
-
-    if (maxScroll < 120) {
-      scrollPositions.push(0, 0, 0);
-    } else {
-      for (let i = 0; i < shotCount; i++) {
-        const ratio = shotCount === 1 ? 0 : i / (shotCount - 1);
-        scrollPositions.push(Math.round(maxScroll * ratio));
-      }
+    const outcome = await Promise.race([captureWork(), deadlinePromise]);
+    if (!res.headersSent) {
+      res.status(outcome.status).json(outcome.body);
     }
-
-    const sectionLabels = [
-      '01-hero.jpg',
-      '02-overview.jpg',
-      '03-sections.jpg',
-      '04-details.jpg',
-      '05-footer.jpg',
-      '06-extra.jpg',
-    ];
-    const shots: Array<{ name: string; dataUrl: string }> = [];
-
-    for (let i = 0; i < scrollPositions.length; i++) {
-      const y = scrollPositions[i];
-      await page.evaluate((scrollY) => window.scrollTo({ top: scrollY, behavior: 'instant' }), y);
-      await page.waitForTimeout(350);
-      const buffer = await page.screenshot({
-        type: 'jpeg',
-        quality: 82,
-      });
-      shots.push({
-        name: sectionLabels[i] || `0${i + 1}-section.jpg`,
-        dataUrl: `data:image/jpeg;base64,${buffer.toString('base64')}`,
-      });
-    }
-
-    res.json({
-      title: facts.title,
-      description: facts.description,
-      headings: facts.headings,
-      ctas: facts.ctas,
-      shots,
-    });
   } catch (err) {
+    if (res.headersSent) return;
     const message = err instanceof Error ? err.message : 'Unable to capture website.';
     if (err instanceof SsrfBlockedError) {
       res.status(err.statusCode).json({ error: message });
       return;
     }
-    if (/timeout/i.test(message)) {
+    if (timedOut || /timeout/i.test(message)) {
       res.status(504).json({
-        error: 'Capture timed out while loading the website. The site may be slow or blocking automated access.',
+        error:
+          'Capture timed out while loading the website. The site may be slow or blocking automated access.',
       });
       return;
     }
     res.status(422).json({ error: message });
   } finally {
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+    if (deadlineHandle) clearTimeout(deadlineHandle);
+    activeCaptureCount = Math.max(0, activeCaptureCount - 1);
+    await closeBrowserSafely();
   }
 });
 
+// Return JSON errors for malformed JSON or oversized bodies on API routes
+app.use(
+  '/api',
+  (
+    err: Error & { status?: number; type?: string },
+    _req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    if (err.type === 'entity.too.large' || err.status === 413) {
+      res.status(413).json({ error: 'Request payload too large.' });
+      return;
+    }
+    if (err instanceof SyntaxError && err.status === 400) {
+      res.status(400).json({ error: 'Invalid JSON request body.' });
+      return;
+    }
+    next(err);
+  }
+);
+
 async function startServer() {
+  if (process.env.NODE_ENV === 'production' && !CAPTURE_TOKEN) {
+    console.error(
+      'ERROR: CAPTURE_TOKEN must be set when NODE_ENV=production. Refusing to start without API authentication.'
+    );
+    process.exit(1);
+  }
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -371,8 +542,12 @@ async function startServer() {
     });
   }
 
+  const resolvedChromium = resolveChromiumExecutable();
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`TourForge Lite server listening on http://0.0.0.0:${PORT}`);
+    console.log(
+      `Chromium executable: ${resolvedChromium ?? 'None found (set PLAYWRIGHT_EXECUTABLE_PATH)'}`
+    );
   });
 }
 

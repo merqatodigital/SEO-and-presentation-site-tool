@@ -103,7 +103,8 @@ async function fetchWithCorsFallback(
   url: string,
   method: 'GET' | 'POST',
   apiKey: string,
-  body?: unknown
+  body?: unknown,
+  captureToken = ''
 ): Promise<Response> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -124,9 +125,13 @@ async function fetchWithCorsFallback(
   } catch (directErr) {
     // Relay external HTTPS endpoints (e.g. NVIDIA NIM) if browser CORS blocks direct fetch
     if (/^https:\/\//i.test(url)) {
+      const relayHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (captureToken.trim()) {
+        relayHeaders.Authorization = `Bearer ${captureToken.trim()}`;
+      }
       return await fetch('/api/relay', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: relayHeaders,
         body: JSON.stringify({
           url,
           method,
@@ -141,7 +146,8 @@ async function fetchWithCorsFallback(
 
 export async function fetchAvailableModels(
   baseUrl: string,
-  apiKey = ''
+  apiKey = '',
+  captureToken = ''
 ): Promise<ModelOption[]> {
   const cleanBase = normalizeBaseUrl(baseUrl);
   if (!cleanBase) {
@@ -149,7 +155,7 @@ export async function fetchAvailableModels(
   }
 
   const url = `${cleanBase}/models`;
-  const response = await fetchWithCorsFallback(url, 'GET', apiKey);
+  const response = await fetchWithCorsFallback(url, 'GET', apiKey, undefined, captureToken);
   const text = await response.text();
 
   let parsed: { data?: RawModelEntry[]; error?: { message?: string } } | null = null;
@@ -226,12 +232,18 @@ async function callChatCompletions(
 ): Promise<string> {
   const url = `${normalizeBaseUrl(settings.baseUrl)}/chat/completions`;
 
-  const response = await fetchWithCorsFallback(url, 'POST', settings.apiKey, {
-    model: settings.model.trim(),
-    temperature: 0.35,
-    max_tokens: maxTokens,
-    messages,
-  });
+  const response = await fetchWithCorsFallback(
+    url,
+    'POST',
+    settings.apiKey,
+    {
+      model: settings.model.trim(),
+      temperature: 0.35,
+      max_tokens: maxTokens,
+      messages,
+    },
+    settings.captureToken
+  );
 
   const text = await response.text();
   let parsed: OpenAICompatibleResponse | null = null;

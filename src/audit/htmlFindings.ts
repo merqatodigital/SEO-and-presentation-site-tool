@@ -1,6 +1,7 @@
 import * as cheerio from 'cheerio';
 import {
   AuditFinding,
+  AuditNote,
   ParsedHtmlFacts,
   ParsedLinks,
   SpeedMetrics,
@@ -24,6 +25,98 @@ const CTA_PATTERN =
 
 const CHAT_HREF_CTA_PATTERN =
   /(?:^|\/\/)(?:wa\.me|api\.whatsapp\.com|chat\.whatsapp\.com|(?:www\.)?(?:m\.me|messenger\.com))\b|^viber:\/\//i;
+
+const BOT_WALL_PATTERN =
+  /just a moment|attention required|checking your browser|access denied|captcha|ddos protection|verify you are human|cf-chl/i;
+
+const SOFT_404_PATTERN = /404|not found|page not found|nothing here/i;
+
+const JS_REQUIRED_NOSCRIPT_PATTERN = /enable\s+javascript|javascript\s+(?:is\s+)?required|requires?\s+javascript/i;
+
+export interface HtmlContentInspection {
+  classification: 'normal' | 'bot-wall' | 'soft-404' | 'js-shell';
+  visibleBodyLength: number;
+  title: string;
+}
+
+export function inspectHtmlContent(html: string, httpStatus: number | null): HtmlContentInspection {
+  if (httpStatus === 403 || httpStatus === 429 || httpStatus === 503) {
+    return { classification: 'bot-wall', visibleBodyLength: 0, title: '' };
+  }
+
+  const $ = cheerio.load(html || '');
+  const title = $('head > title').first().text().replace(/\s+/g, ' ').trim();
+  const h1Text = $('h1').first().text().replace(/\s+/g, ' ').trim();
+  const noscriptText = $('noscript').text().replace(/\s+/g, ' ').trim();
+  const hasSpaMount =
+    $('#root, #app, #__next, [data-reactroot]').length > 0 ||
+    JS_REQUIRED_NOSCRIPT_PATTERN.test(noscriptText);
+
+  const $clone = cheerio.load(html || '');
+  $clone('script, style, noscript, svg, template').remove();
+  const visibleBodyText = ($clone('body').text() || $clone.root().text())
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (BOT_WALL_PATTERN.test(title) || BOT_WALL_PATTERN.test(visibleBodyText)) {
+    return {
+      classification: 'bot-wall',
+      visibleBodyLength: visibleBodyText.length,
+      title,
+    };
+  }
+
+  if (
+    httpStatus === 200 &&
+    visibleBodyText.length < 300 &&
+    (SOFT_404_PATTERN.test(title) || SOFT_404_PATTERN.test(h1Text))
+  ) {
+    return {
+      classification: 'soft-404',
+      visibleBodyLength: visibleBodyText.length,
+      title,
+    };
+  }
+
+  if (httpStatus === 200 && visibleBodyText.length < 200 && hasSpaMount) {
+    return {
+      classification: 'js-shell',
+      visibleBodyLength: visibleBodyText.length,
+      title,
+    };
+  }
+
+  return {
+    classification: 'normal',
+    visibleBodyLength: visibleBodyText.length,
+    title,
+  };
+}
+
+export function evaluateHostSwitch(
+  requestedUrl: string,
+  finalUrl: string | null
+): { redirectedFromHost?: string; note?: AuditNote } {
+  if (!finalUrl) return {};
+  try {
+    const reqUrl = new URL(/^https?:\/\//i.test(requestedUrl) ? requestedUrl : `https://${requestedUrl}`);
+    const finUrl = new URL(finalUrl);
+    const reqBare = reqUrl.hostname.toLowerCase().replace(/^www\./, '');
+    const finBare = finUrl.hostname.toLowerCase().replace(/^www\./, '');
+    if (reqBare && finBare && reqBare !== finBare) {
+      return {
+        redirectedFromHost: reqUrl.hostname,
+        note: {
+          code: 'host-switch',
+          message: `Requested ${reqUrl.hostname} but audited ${finUrl.hostname} after redirect.`,
+        },
+      };
+    }
+  } catch {
+    // Ignore malformed URLs
+  }
+  return {};
+}
 
 export function cleanTitleToBrandName(rawTitle: string): string {
   const title = rawTitle.replace(/\s+/g, ' ').trim();
@@ -285,6 +378,7 @@ export function parseHtmlWithCheerio(html: string): ParsedHtmlFacts {
 export interface BuildAutomatedFindingsInput {
   isHttps: boolean | null;
   fetchError: string | null;
+  contentError?: string | null;
   ttfbMs?: number | null;
   ttfbSampleCount?: number;
   parsed: ParsedHtmlFacts | null;
@@ -298,6 +392,7 @@ export function buildAutomatedFindings(input: BuildAutomatedFindingsInput): Audi
   const {
     isHttps,
     fetchError,
+    contentError,
     ttfbMs,
     ttfbSampleCount,
     parsed,
@@ -307,7 +402,7 @@ export function buildAutomatedFindings(input: BuildAutomatedFindingsInput): Audi
     speedReason,
   } = input;
   const findings: AuditFinding[] = [];
-  const unreachableMsg = fetchError || 'Page HTML could not be retrieved';
+  const unreachableMsg = contentError || fetchError || 'Page HTML could not be retrieved';
   const speedFallback = speedReason || 'Speed test did not complete';
 
   // --- SPEED & MOBILE ---

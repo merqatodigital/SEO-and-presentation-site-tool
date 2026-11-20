@@ -66,6 +66,9 @@ export async function runSiteAudit(
   }
 
   if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error('Server token missing or wrong. Check Settings.');
+    }
     const serverErr =
       parsedBody &&
       typeof parsedBody === 'object' &&

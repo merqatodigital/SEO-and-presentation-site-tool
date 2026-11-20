@@ -209,42 +209,6 @@ export function buildLlmsTxt(
   return lines.join('\n').trim();
 }
 
-export function buildJsonLdSnippet(
-  project: ProjectBrief,
-  aiSearch: AISearchLayerData
-): string {
-  const name = project.clientName.trim() || 'Client Business';
-  const businessType = project.businessType.trim() || 'LocalBusiness';
-
-  const schemaGraph = {
-    '@context': 'https://schema.org',
-    '@graph': [
-      {
-        '@type': 'LocalBusiness',
-        name,
-        description: aiSearch.primaryOffer,
-        url: aiSearch.websiteUrl,
-        areaServed: aiSearch.serviceArea,
-        knowsAbout: businessType,
-        slogan: aiSearch.keyDifferentiator,
-      },
-      {
-        '@type': 'FAQPage',
-        mainEntity: aiSearch.faqs.map((qa) => ({
-          '@type': 'Question',
-          name: qa.question,
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: qa.answer,
-          },
-        })),
-      },
-    ],
-  };
-
-  return `<script type="application/ld+json">\n${JSON.stringify(schemaGraph, null, 2)}\n</script>`;
-}
-
 export const DEFAULT_FOOTPRINT: FootprintNode[] = [
   {
     id: 'website',

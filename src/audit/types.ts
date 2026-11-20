@@ -26,14 +26,6 @@ export const AUDIT_CATEGORIES: CategoryDefinition[] = [
   { id: 'social', label: 'Social & Listings Consistency', weight: 15 },
 ];
 
-export const CATEGORY_WEIGHTS: Record<AuditCategoryId, number> = {
-  gbp: 30,
-  seo: 20,
-  contact: 20,
-  speed: 15,
-  social: 15,
-};
-
 export const AuditFindingSchema = z.object({
   id: z.string().min(1),
   category: AuditCategoryIdSchema,
@@ -112,6 +104,15 @@ export const ParsedHtmlFactsSchema = z.object({
 });
 export type ParsedHtmlFacts = z.infer<typeof ParsedHtmlFactsSchema>;
 
+export const AuditNoteSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+});
+export type AuditNote = z.infer<typeof AuditNoteSchema>;
+
+export const ContentSourceSchema = z.enum(['raw', 'rendered', 'blocked']);
+export type ContentSource = z.infer<typeof ContentSourceSchema>;
+
 export const AuditResultSchema = z.object({
   schemaVersion: z.string().default('1.0'),
   requestedUrl: z.string(),
@@ -123,6 +124,9 @@ export const AuditResultSchema = z.object({
   htmlBytes: z.number().nullable(),
   isHttps: z.boolean().nullable(),
   fetchError: z.string().nullable(),
+  contentSource: ContentSourceSchema.optional(),
+  auditNotes: z.array(AuditNoteSchema).optional(),
+  redirectedFromHost: z.string().optional(),
   parsed: ParsedHtmlFactsSchema.nullable(),
   robotsTxt: z.object({
     exists: z.boolean().nullable(),

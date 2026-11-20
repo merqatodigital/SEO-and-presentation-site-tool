@@ -214,7 +214,8 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
     const text = buildOutreachSummary(
       resolvedClientName,
       audit?.finalUrl || auditUrl || audit?.requestedUrl || '',
-      scorecard
+      scorecard,
+      audit?.auditNotes
     );
     try {
       await navigator.clipboard.writeText(text);
@@ -401,6 +402,17 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
 
             {audit ? (
               <div className="space-y-6">
+                {audit.auditNotes && audit.auditNotes.length > 0 && (
+                  <div className="space-y-1.5 rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-xs leading-relaxed text-sky-950 dark:border-sky-900/60 dark:bg-sky-950/40 dark:text-sky-100">
+                    {audit.auditNotes.map((note, idx) => (
+                      <div key={idx} className="flex items-start gap-2">
+                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-sky-700 dark:text-sky-400" />
+                        <span>{note.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {audit.fetchError && (
                   <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-relaxed text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/50 dark:text-amber-200">
                     <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
@@ -707,6 +719,17 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
                 </div>
               </div>
             </div>
+
+            {audit?.auditNotes && audit.auditNotes.length > 0 && (
+              <div className="space-y-1.5 rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-xs leading-relaxed text-sky-950 dark:border-sky-900/60 dark:bg-sky-950/40 dark:text-sky-100">
+                {audit.auditNotes.map((note, idx) => (
+                  <div key={idx} className="flex items-start gap-2">
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-sky-700 dark:text-sky-400" />
+                    <span>{note.message}</span>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {isProvisional && (
               <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/50 dark:text-amber-200">

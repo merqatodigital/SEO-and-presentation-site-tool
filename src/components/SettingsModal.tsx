@@ -49,11 +49,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     message: string;
   } | null>(null);
 
-  const refreshModels = async (targetBaseUrl: string, targetApiKey: string) => {
+  const refreshModels = async (
+    targetBaseUrl: string,
+    targetApiKey: string,
+    targetCaptureToken: string
+  ) => {
     setLoadingModels(true);
     setModelsError(null);
     try {
-      const list = await fetchAvailableModels(targetBaseUrl, targetApiKey);
+      const list = await fetchAvailableModels(targetBaseUrl, targetApiKey, targetCaptureToken);
       setModels(list);
       setModelsUpdatedAt(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
     } catch (err) {
@@ -69,7 +73,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setTestResult(null);
       setCaptureTestResult(null);
       setModelsError(null);
-      void refreshModels(settings.baseUrl || OPENROUTER_URL, settings.apiKey);
+      void refreshModels(
+        settings.baseUrl || OPENROUTER_URL,
+        settings.apiKey,
+        settings.captureToken
+      );
     }
   }, [isOpen, settings]);
 
@@ -134,7 +142,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setDraft((prev) => ({ ...prev, baseUrl: nextBaseUrl }));
     setTierFilter('all');
     setModelSearch('');
-    void refreshModels(nextBaseUrl, draft.apiKey);
+    void refreshModels(nextBaseUrl, draft.apiKey, draft.captureToken);
   };
 
   const handleTest = async () => {
@@ -294,7 +302,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 )}
                 <button
                   type="button"
-                  onClick={() => void refreshModels(draft.baseUrl, draft.apiKey)}
+                  onClick={() => void refreshModels(draft.baseUrl, draft.apiKey, draft.captureToken)}
                   disabled={loadingModels}
                   className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-800 transition-colors hover:bg-slate-100 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
                 >

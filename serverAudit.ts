@@ -1,126 +1,53 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import dns from 'node:dns/promises';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import lighthouse from 'lighthouse';
-import { buildAutomatedFindings, parseHtmlWithCheerio } from './src/audit/htmlFindings.ts';
+import { chromium } from 'playwright-core';
 import {
+  CHROME_USER_AGENT,
+  CHROMIUM_FLAGS,
+  SsrfBlockedError,
+  attachPublicUrlRouteFilter,
+  isPrivateOrBlockedIp,
+  validatePublicTargetUrl,
+} from './serverShared.ts';
+import {
+  buildAutomatedFindings,
+  evaluateHostSwitch,
+  inspectHtmlContent,
+  parseHtmlWithCheerio,
+} from './src/audit/htmlFindings.ts';
+import {
+  AuditFinding,
+  AuditNote,
   AuditResult,
   AuditResultSchema,
+  ContentSource,
   ParsedHtmlFacts,
   SpeedMetrics,
   SpeedOpportunity,
 } from './src/audit/types.ts';
 
-export const PLAYWRIGHT_EXECUTABLE_CANDIDATES = [
-  process.env.PLAYWRIGHT_EXECUTABLE_PATH,
+export { SsrfBlockedError, isPrivateOrBlockedIp, validatePublicTargetUrl };
+
+export const CHROMIUM_EXECUTABLE_CANDIDATES = [
+  process.env.PLAYWRIGHT_EXECUTABLE_PATH?.trim() || '',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/google-chrome-stable',
   '/ms-playwright/chrome-headless-shell-linux64/chrome-headless-shell',
   '/ms-playwright/chromium_headless_shell-1247/chrome-headless-shell-linux64/chrome-headless-shell',
 ].filter((candidate): candidate is string => Boolean(candidate));
 
-export function resolveChromiumExecutable(): string | undefined {
-  for (const candidate of PLAYWRIGHT_EXECUTABLE_CANDIDATES) {
+export function resolveChromiumExecutable(): string | null {
+  for (const candidate of CHROMIUM_EXECUTABLE_CANDIDATES) {
     if (fs.existsSync(candidate)) {
       return candidate;
     }
   }
-  return undefined;
-}
-
-export function isPrivateOrBlockedIp(ip: string): boolean {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map(Number);
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    return false;
-  }
-  if (net.isIPv6(ip)) {
-    const normalized = ip.toLowerCase();
-    if (
-      normalized === '::1' ||
-      normalized === '::' ||
-      normalized.startsWith('fc') ||
-      normalized.startsWith('fd') ||
-      normalized.startsWith('fe80') ||
-      normalized.startsWith('::ffff:127.') ||
-      normalized.startsWith('::ffff:10.') ||
-      normalized.startsWith('::ffff:192.168.') ||
-      normalized.startsWith('::ffff:169.254.') ||
-      normalized.startsWith('::ffff:172.')
-    ) {
-      if (normalized.startsWith('::ffff:172.')) {
-        const oct = Number(normalized.split('.')[1]);
-        return oct >= 16 && oct <= 31;
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
-export class SsrfBlockedError extends Error {
-  statusCode: number;
-  constructor(message: string, statusCode = 403) {
-    super(message);
-    this.statusCode = statusCode;
-  }
-}
-
-export async function validatePublicTargetUrl(rawUrl: string): Promise<URL> {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    throw Object.assign(new Error('Invalid website URL.'), { statusCode: 400 });
-  }
-
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new SsrfBlockedError('Only http:// and https:// URLs are allowed.', 403);
-  }
-
-  const hostname = parsed.hostname.toLowerCase();
-  if (
-    hostname === 'localhost' ||
-    hostname.endsWith('.localhost') ||
-    hostname.endsWith('.local') ||
-    hostname.endsWith('.internal')
-  ) {
-    throw new SsrfBlockedError('Blocked local or private network URL.', 403);
-  }
-
-  if (net.isIP(hostname)) {
-    if (isPrivateOrBlockedIp(hostname)) {
-      throw new SsrfBlockedError('Blocked private IP address.', 403);
-    }
-    return parsed;
-  }
-
-  try {
-    const addresses = await dns.lookup(hostname, { all: true });
-    if (addresses.length === 0) {
-      throw Object.assign(new Error(`Could not resolve domain "${hostname}".`), { statusCode: 422 });
-    }
-    for (const addr of addresses) {
-      if (isPrivateOrBlockedIp(addr.address)) {
-        throw new SsrfBlockedError('Blocked URL resolving to a private network address.', 403);
-      }
-    }
-  } catch (err) {
-    if (err instanceof SsrfBlockedError || (err && typeof err === 'object' && 'statusCode' in err)) {
-      throw err;
-    }
-    throw Object.assign(
-      new Error(`Could not reach domain "${hostname}". Verify the URL and try again.`),
-      { statusCode: 422 }
-    );
-  }
-
-  return parsed;
+  return null;
 }
 
 interface SafeFetchResult {
@@ -155,8 +82,7 @@ export async function fetchWithSsrfProtection(
         cache: 'no-store',
         signal: controller.signal,
         headers: {
-          'User-Agent':
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'User-Agent': CHROME_USER_AGENT,
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
       });
@@ -303,7 +229,7 @@ async function runLighthouseAudit(
   if (!executablePath) {
     return {
       speed: null,
-      reason: 'Headless Chromium binary was not found on the server.',
+      reason: 'No Chromium found. Set PLAYWRIGHT_EXECUTABLE_PATH.',
     };
   }
 
@@ -322,15 +248,19 @@ async function runLighthouseAudit(
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
   try {
-    proc = spawn(executablePath, [
-      '--headless=new',
-      `--remote-debugging-port=${port}`,
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      `--user-data-dir=${userDataDir}`,
-    ]);
+    proc = spawn(
+      executablePath,
+      [
+        '--headless=new',
+        `--remote-debugging-port=${port}`,
+        ...CHROMIUM_FLAGS,
+        `--user-data-dir=${userDataDir}`,
+      ],
+      {
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'ignore', 'pipe'],
+      }
+    );
 
     const runPromise = (async (): Promise<SpeedMetrics> => {
       await new Promise<void>((resolve, reject) => {
@@ -446,8 +376,24 @@ async function runLighthouseAudit(
     };
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
-    if (proc && !proc.killed) {
-      proc.kill('SIGKILL');
+    if (proc) {
+      if (process.platform !== 'win32' && proc.pid) {
+        try {
+          process.kill(-proc.pid, 'SIGKILL');
+        } catch {
+          try {
+            proc.kill('SIGKILL');
+          } catch {
+            // Process already exited
+          }
+        }
+      } else if (!proc.killed) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // Process already exited
+        }
+      }
     }
     try {
       fs.rmSync(userDataDir, { recursive: true, force: true });
@@ -457,16 +403,318 @@ async function runLighthouseAudit(
   }
 }
 
-// Strict concurrency-1 queue for CPU-heavy Lighthouse audits
+export class AuditQueueFullError extends Error {
+  statusCode = 503;
+  constructor(message = 'Audit queue is full, try again in a minute') {
+    super(message);
+  }
+}
+
+const MAX_AUDIT_PENDING = 5;
+let pendingAuditCount = 0;
+
+// Strict concurrency-1 queue for CPU-heavy Lighthouse audits (max 5 pending)
 let auditQueueTail: Promise<unknown> = Promise.resolve();
 
 export function enqueueAudit(rawUrl: string): Promise<AuditResult> {
-  const next = auditQueueTail.then(
-    () => executeFullSiteAudit(rawUrl),
-    () => executeFullSiteAudit(rawUrl)
-  );
+  if (pendingAuditCount >= MAX_AUDIT_PENDING) {
+    return Promise.reject(new AuditQueueFullError());
+  }
+  pendingAuditCount++;
+  const next = auditQueueTail
+    .then(
+      () => executeFullSiteAudit(rawUrl),
+      () => executeFullSiteAudit(rawUrl)
+    )
+    .finally(() => {
+      pendingAuditCount = Math.max(0, pendingAuditCount - 1);
+    });
   auditQueueTail = next.catch(() => {});
   return next;
+}
+
+const JS_SHELL_HARD_CAP_MS = 45_000;
+
+export async function renderPageWithPlaywright(targetUrl: string): Promise<string> {
+  const executablePath = resolveChromiumExecutable();
+  if (!executablePath) {
+    throw new Error('No Chromium found. Set PLAYWRIGHT_EXECUTABLE_PATH.');
+  }
+
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  let deadlineHandle: ReturnType<typeof setTimeout> | null = null;
+
+  const closeBrowserSafely = async () => {
+    const active = browser;
+    browser = null;
+    if (active) {
+      await active.close().catch(() => {});
+    }
+  };
+
+  try {
+    const deadlinePromise = new Promise<never>((_, reject) => {
+      deadlineHandle = setTimeout(() => {
+        void closeBrowserSafely();
+        reject(new Error('JavaScript page render timed out after 45 seconds.'));
+      }, JS_SHELL_HARD_CAP_MS);
+    });
+
+    const renderWork = async (): Promise<string> => {
+      browser = await chromium.launch({
+        executablePath,
+        headless: true,
+        args: [...CHROMIUM_FLAGS],
+      });
+
+      const context = await browser.newContext({
+        viewport: { width: 1280, height: 800 },
+        deviceScaleFactor: 1,
+        userAgent: CHROME_USER_AGENT,
+      });
+
+      const page = await context.newPage();
+      const routeFilter = await attachPublicUrlRouteFilter(page);
+
+      const response = await page.goto(targetUrl, {
+        waitUntil: 'load',
+        timeout: 25_000,
+      });
+
+      const blockedNavError = routeFilter.getBlockedNavigationError();
+      if (blockedNavError) {
+        throw new SsrfBlockedError(blockedNavError, 403);
+      }
+
+      await validatePublicTargetUrl(page.url());
+
+      if (response && (response.status() === 403 || response.status() === 429 || response.status() === 503)) {
+        throw new Error(`HTTP_${response.status()}`);
+      }
+
+      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+      return await page.content();
+    };
+
+    return await Promise.race([renderWork(), deadlinePromise]);
+  } finally {
+    if (deadlineHandle) clearTimeout(deadlineHandle);
+    await closeBrowserSafely();
+  }
+}
+
+export interface ResolveHtmlContentOptions {
+  requestedUrl: string;
+  finalUrl: string | null;
+  httpStatus: number | null;
+  html: string;
+  fetchError: string | null;
+  renderJsShell?: (url: string) => Promise<string>;
+}
+
+export interface HtmlContentResolution {
+  contentSource: ContentSource;
+  auditNotes: AuditNote[];
+  redirectedFromHost?: string;
+  parsed: ParsedHtmlFacts | null;
+  contentError: string | null;
+}
+
+export async function resolveHtmlContent(
+  options: ResolveHtmlContentOptions
+): Promise<HtmlContentResolution> {
+  const auditNotes: AuditNote[] = [];
+  const hostSwitch = evaluateHostSwitch(options.requestedUrl, options.finalUrl);
+  if (hostSwitch.note) {
+    auditNotes.push(hostSwitch.note);
+  }
+
+  if (options.httpStatus === 403 || options.httpStatus === 429 || options.httpStatus === 503) {
+    auditNotes.push({
+      code: 'bot-wall',
+      message: 'This site blocks automated checks, so content and speed checks could not be completed.',
+    });
+    return {
+      contentSource: 'blocked',
+      auditNotes,
+      redirectedFromHost: hostSwitch.redirectedFromHost,
+      parsed: null,
+      contentError: 'This site blocks automated checks',
+    };
+  }
+
+  if (options.fetchError) {
+    return {
+      contentSource: 'raw',
+      auditNotes,
+      redirectedFromHost: hostSwitch.redirectedFromHost,
+      parsed: null,
+      contentError: options.fetchError,
+    };
+  }
+
+  const inspection = inspectHtmlContent(options.html, options.httpStatus);
+
+  if (inspection.classification === 'bot-wall') {
+    auditNotes.push({
+      code: 'bot-wall',
+      message: 'This site blocks automated checks, so content and speed checks could not be completed.',
+    });
+    return {
+      contentSource: 'blocked',
+      auditNotes,
+      redirectedFromHost: hostSwitch.redirectedFromHost,
+      parsed: null,
+      contentError: 'This site blocks automated checks',
+    };
+  }
+
+  if (inspection.classification === 'soft-404') {
+    auditNotes.push({
+      code: 'soft-404',
+      message: 'This page returned a "not found" message instead of real site content.',
+    });
+    return {
+      contentSource: 'raw',
+      auditNotes,
+      redirectedFromHost: hostSwitch.redirectedFromHost,
+      parsed: null,
+      contentError: 'Page returned a soft 404 (not found) message.',
+    };
+  }
+
+  if (inspection.classification === 'js-shell') {
+    if (options.renderJsShell) {
+      try {
+        const renderedHtml = await options.renderJsShell(options.finalUrl || options.requestedUrl);
+        const renderedInspection = inspectHtmlContent(renderedHtml, 200);
+        if (renderedInspection.classification === 'bot-wall') {
+          auditNotes.push({
+            code: 'bot-wall',
+            message: 'This site blocks automated checks, so content and speed checks could not be completed.',
+          });
+          return {
+            contentSource: 'blocked',
+            auditNotes,
+            redirectedFromHost: hostSwitch.redirectedFromHost,
+            parsed: null,
+            contentError: 'This site blocks automated checks',
+          };
+        }
+        if (renderedInspection.classification === 'soft-404') {
+          auditNotes.push({
+            code: 'soft-404',
+            message: 'This page returned a "not found" message instead of real site content.',
+          });
+          return {
+            contentSource: 'raw',
+            auditNotes,
+            redirectedFromHost: hostSwitch.redirectedFromHost,
+            parsed: null,
+            contentError: 'Page returned a soft 404 (not found) message.',
+          };
+        }
+
+        auditNotes.push({
+          code: 'rendered',
+          message: 'Read from the rendered page; this site builds its content with JavaScript.',
+        });
+        return {
+          contentSource: 'rendered',
+          auditNotes,
+          redirectedFromHost: hostSwitch.redirectedFromHost,
+          parsed: parseHtmlWithCheerio(renderedHtml),
+          contentError: null,
+        };
+      } catch (err) {
+        if (err instanceof SsrfBlockedError) {
+          throw err;
+        }
+        if (err instanceof Error && /^HTTP_(?:403|429|503)$/.test(err.message)) {
+          auditNotes.push({
+            code: 'bot-wall',
+            message: 'This site blocks automated checks, so content and speed checks could not be completed.',
+          });
+          return {
+            contentSource: 'blocked',
+            auditNotes,
+            redirectedFromHost: hostSwitch.redirectedFromHost,
+            parsed: null,
+            contentError: 'This site blocks automated checks',
+          };
+        }
+        auditNotes.push({
+          code: 'render-failed',
+          message: 'Could not load dynamic JavaScript content; content checks were marked Unknown.',
+        });
+        return {
+          contentSource: 'raw',
+          auditNotes,
+          redirectedFromHost: hostSwitch.redirectedFromHost,
+          parsed: null,
+          contentError: 'Could not render JavaScript page content.',
+        };
+      }
+    }
+
+    auditNotes.push({
+      code: 'render-failed',
+      message: 'Could not load dynamic JavaScript content; content checks were marked Unknown.',
+    });
+    return {
+      contentSource: 'raw',
+      auditNotes,
+      redirectedFromHost: hostSwitch.redirectedFromHost,
+      parsed: null,
+      contentError: 'Could not render JavaScript page content.',
+    };
+  }
+
+  return {
+    contentSource: 'raw',
+    auditNotes,
+    redirectedFromHost: hostSwitch.redirectedFromHost,
+    parsed: parseHtmlWithCheerio(options.html),
+    contentError: null,
+  };
+}
+
+export interface ResolveHtmlAndFindingsInput extends ResolveHtmlContentOptions {
+  isHttps: boolean | null;
+  ttfbMs: number | null;
+  ttfbSampleCount: number;
+  robotsTxt: AuditResult['robotsTxt'];
+  sitemapXml: AuditResult['sitemapXml'];
+  speed: SpeedMetrics | null;
+  speedReason: string | null;
+}
+
+export async function resolveHtmlContentAndFindings(
+  input: ResolveHtmlAndFindingsInput
+): Promise<HtmlContentResolution & { findings: AuditFinding[] }> {
+  const resolution = await resolveHtmlContent(input);
+  const isBlocked = resolution.contentSource === 'blocked';
+  const findings = buildAutomatedFindings({
+    isHttps: input.isHttps,
+    fetchError: input.fetchError,
+    contentError: resolution.contentError,
+    ttfbMs: input.ttfbMs,
+    ttfbSampleCount: input.ttfbSampleCount,
+    parsed: resolution.parsed,
+    robotsTxt: isBlocked
+      ? { exists: null, allowsIndexing: null, reason: 'This site blocks automated checks' }
+      : input.robotsTxt,
+    sitemapXml: isBlocked
+      ? { exists: null, reason: 'This site blocks automated checks' }
+      : input.sitemapXml,
+    speed: isBlocked ? null : input.speed,
+    speedReason: isBlocked ? 'This site blocks automated checks' : input.speedReason,
+  });
+
+  return {
+    ...resolution,
+    findings,
+  };
 }
 
 export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult> {
@@ -503,6 +751,8 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
       htmlBytes: null,
       isHttps: rawUrl.toLowerCase().startsWith('https://') ? true : null,
       fetchError: parsedInput.error,
+      contentSource: 'raw',
+      auditNotes: [],
       parsed: null,
       robotsTxt: { exists: null, allowsIndexing: null, reason: parsedInput.error },
       sitemapXml: { exists: null, reason: parsedInput.error },
@@ -519,7 +769,7 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
   let htmlBytes: number | null = null;
   let isHttps: boolean | null = parsedInput.protocol === 'https:';
   let fetchError: string | null = null;
-  let parsedHtml: ParsedHtmlFacts | null = null;
+  let rawHtml = '';
 
   try {
     const pageResp = await fetchWithSsrfProtection(parsedInput.toString(), {
@@ -532,12 +782,11 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
     ttfbSamplesMs.push(pageResp.ttfbMs);
     htmlBytes = pageResp.bytes;
     isHttps = new URL(pageResp.finalUrl).protocol === 'https:';
+    rawHtml = pageResp.text;
 
     if (pageResp.statusCode >= 400) {
       fetchError = `Website returned HTTP ${pageResp.statusCode}.`;
-    } else if (pageResp.text.trim()) {
-      parsedHtml = parseHtmlWithCheerio(pageResp.text);
-    } else {
+    } else if (!pageResp.text.trim()) {
       fetchError = 'Website returned an empty HTML document.';
     }
 
@@ -566,12 +815,27 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
     fetchError = err instanceof Error ? err.message : 'Unable to fetch target HTML.';
   }
 
-  // Check robots.txt and sitemap.xml relative to final origin
+  const contentResolution = await resolveHtmlContent({
+    requestedUrl: rawUrl,
+    finalUrl,
+    httpStatus,
+    html: rawHtml,
+    fetchError,
+    renderJsShell: renderPageWithPlaywright,
+  });
+
+  const isBlocked = contentResolution.contentSource === 'blocked';
+  const isSoft404 = contentResolution.auditNotes.some((n) => n.code === 'soft-404');
+
+  // Check robots.txt and sitemap.xml relative to final origin (skip when blocked by bot wall)
   const originUrl = new URL(finalUrl || parsedInput.toString()).origin;
   let robotsTxt: AuditResult['robotsTxt'] = { exists: null, allowsIndexing: null };
   let sitemapXml: AuditResult['sitemapXml'] = { exists: null };
 
-  if (!fetchError || httpStatus !== null) {
+  if (isBlocked) {
+    robotsTxt = { exists: null, allowsIndexing: null, reason: 'This site blocks automated checks' };
+    sitemapXml = { exists: null, reason: 'This site blocks automated checks' };
+  } else if (!fetchError || httpStatus !== null) {
     try {
       const robotsResp = await fetchWithSsrfProtection(`${originUrl}/robots.txt`, {
         timeoutMs: 10000,
@@ -620,10 +884,14 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
     sitemapXml = { exists: null, reason: fetchError };
   }
 
-  // Run open-source Lighthouse if main HTML loaded cleanly
+  // Run open-source Lighthouse if main HTML loaded cleanly and was not blocked/soft-404
   let speed: SpeedMetrics | null = null;
   let speedReason: string | null = null;
-  if (!fetchError && finalUrl) {
+  if (isBlocked) {
+    speedReason = 'This site blocks automated checks';
+  } else if (isSoft404) {
+    speedReason = 'Skipped speed test because the page returned a soft 404.';
+  } else if (!fetchError && finalUrl) {
     const lh = await runLighthouseAudit(finalUrl);
     speed = lh.speed;
     speedReason = lh.reason;
@@ -634,9 +902,10 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
   const findings = buildAutomatedFindings({
     isHttps,
     fetchError,
+    contentError: contentResolution.contentError,
     ttfbMs,
     ttfbSampleCount: ttfbSamplesMs.length,
-    parsed: parsedHtml,
+    parsed: contentResolution.parsed,
     robotsTxt,
     sitemapXml,
     speed,
@@ -654,7 +923,12 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
     htmlBytes,
     isHttps,
     fetchError,
-    parsed: parsedHtml,
+    contentSource: contentResolution.contentSource,
+    auditNotes: contentResolution.auditNotes,
+    ...(contentResolution.redirectedFromHost
+      ? { redirectedFromHost: contentResolution.redirectedFromHost }
+      : {}),
+    parsed: contentResolution.parsed,
     robotsTxt,
     sitemapXml,
     speed,

@@ -116,6 +116,14 @@ export const PrintScorecardView: React.FC<PrintScorecardViewProps> = ({
         </div>
       </div>
 
+      {audit?.auditNotes && audit.auditNotes.length > 0 && (
+        <div className="mt-2.5 space-y-0.5 rounded border border-slate-300 bg-slate-50 px-3 py-1.5 text-[10px] text-slate-700">
+          {audit.auditNotes.map((note, idx) => (
+            <p key={idx}>Note: {note.message}</p>
+          ))}
+        </div>
+      )}
+
       {/* 5 Category Bars */}
       <div className="mt-3.5">
         <h2 className="text-xs font-bold tracking-wide text-slate-800">

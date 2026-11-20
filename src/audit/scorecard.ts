@@ -4,6 +4,7 @@ import {
   AuditAssumptions,
   AuditCategoryId,
   AuditFinding,
+  AuditNote,
   AuditResult,
   CategoryScore,
   IgnoredLeadsEstimate,
@@ -257,7 +258,8 @@ export function computeScorecard(
 export function buildOutreachSummary(
   clientName: string,
   websiteUrl: string,
-  scorecard: Scorecard
+  scorecard: Scorecard,
+  auditNotes?: AuditNote[]
 ): string {
   const displayClient = clientName.trim() || 'your team';
   const displayUrl = websiteUrl.trim() || 'your website';
@@ -284,6 +286,13 @@ export function buildOutreachSummary(
     `Here are the top 3 quick wins that could bring in more direct bookings and inquiries:`,
     bullets,
   ];
+
+  if (auditNotes && auditNotes.length > 0) {
+    lines.push(``);
+    for (const note of auditNotes) {
+      lines.push(`Note: ${note.message}`);
+    }
+  }
 
   if (isProvisional) {
     lines.push(``, `Add Google Business Profile data for a final grade.`);

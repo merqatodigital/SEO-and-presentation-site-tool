@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { chromium } from 'playwright-core';
 import {
+  AuditJobSkippedError,
   AuditQueueFullError,
   enqueueAudit,
   resolveChromiumExecutable,
@@ -13,11 +14,12 @@ import {
   SlidingWindowRateLimiter,
   SsrfBlockedError,
   attachPublicUrlRouteFilter,
-  isAllowedRelayHost,
   parseAllowedRelayHosts,
   requireCaptureToken,
+  sanitizePlaywrightNavigationError,
   sendTargetUrlError,
   validatePublicTargetUrl,
+  validateRelayUrlBeforeDns,
 } from './serverShared.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -69,21 +71,29 @@ if (TRUST_PROXY) {
   app.set('trust proxy', 1);
 }
 
+if (process.env.NODE_ENV === 'production') {
+  app.use((_req, res, next) => {
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' https:; frame-ancestors 'none'"
+    );
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    next();
+  });
+}
+
 const smallJsonParser = express.json({ limit: '64kb' });
 const relayJsonParser = express.json({ limit: '25mb' });
 
 let activeCaptureCount = 0;
 
-app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true,
-    chromium: resolveChromiumExecutable(),
-    node: process.version,
-    uptime: Math.floor(process.uptime()),
-  });
-});
-
-app.post('/api/relay', relayJsonParser, async (req, res) => {
+function relayPreAuthMiddleware(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
   if (!requireCaptureToken(req, res, CAPTURE_TOKEN)) {
     return;
   }
@@ -96,6 +106,19 @@ app.post('/api/relay', relayJsonParser, async (req, res) => {
     return;
   }
 
+  next();
+}
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    chromium: resolveChromiumExecutable(),
+    node: process.version,
+    uptime: Math.floor(process.uptime()),
+  });
+});
+
+app.post('/api/relay', relayPreAuthMiddleware, relayJsonParser, async (req, res) => {
   const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   const method = req.body?.method === 'GET' ? 'GET' : 'POST';
   const apiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : '';
@@ -106,23 +129,18 @@ app.post('/api/relay', relayJsonParser, async (req, res) => {
     return;
   }
 
-  let targetUrl: URL;
   try {
-    targetUrl = await validatePublicTargetUrl(rawUrl);
+    validateRelayUrlBeforeDns(rawUrl, RELAY_ALLOWED_HOSTS);
   } catch (err) {
     sendTargetUrlError(res, err);
     return;
   }
 
-  if (targetUrl.protocol !== 'https:') {
-    res.status(403).json({ error: 'Relay only allows HTTPS external API endpoints.' });
-    return;
-  }
-
-  if (!isAllowedRelayHost(targetUrl.hostname, RELAY_ALLOWED_HOSTS)) {
-    res.status(403).json({
-      error: `Relay target host "${targetUrl.hostname}" is not in RELAY_ALLOWED_HOSTS.`,
-    });
+  let targetUrl: URL;
+  try {
+    targetUrl = await validatePublicTargetUrl(rawUrl);
+  } catch (err) {
+    sendTargetUrlError(res, err);
     return;
   }
 
@@ -226,10 +244,24 @@ app.post('/api/audit', smallJsonParser, async (req, res) => {
     return;
   }
 
+  let clientDisconnected = false;
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientDisconnected = true;
+    }
+  });
+
   try {
-    const result = await enqueueAudit(rawUrl);
-    res.json(result);
+    const result = await enqueueAudit(rawUrl, {
+      shouldSkip: () => clientDisconnected || res.closed || req.socket.destroyed,
+    });
+    if (!res.headersSent && !clientDisconnected) {
+      res.json(result);
+    }
   } catch (err) {
+    if (err instanceof AuditJobSkippedError || res.headersSent || clientDisconnected) {
+      return;
+    }
     if (err instanceof AuditQueueFullError) {
       res.status(503).json({ error: err.message });
       return;
@@ -285,6 +317,9 @@ app.post('/api/capture', smallJsonParser, async (req, res) => {
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
   let deadlineHandle: ReturnType<typeof setTimeout> | null = null;
   let timedOut = false;
+  const routeFilterHolder: { getBlockedError: (() => string | null) | null } = {
+    getBlockedError: null,
+  };
 
   const closeBrowserSafely = async () => {
     const active = browser;
@@ -319,6 +354,7 @@ app.post('/api/capture', smallJsonParser, async (req, res) => {
       const page = await context.newPage();
 
       const routeFilter = await attachPublicUrlRouteFilter(page);
+      routeFilterHolder.getBlockedError = routeFilter.getBlockedNavigationError;
 
       const response = await page.goto(targetUrl.toString(), {
         waitUntil: 'domcontentloaded',
@@ -478,19 +514,24 @@ app.post('/api/capture', smallJsonParser, async (req, res) => {
     }
   } catch (err) {
     if (res.headersSent) return;
-    const message = err instanceof Error ? err.message : 'Unable to capture website.';
-    if (err instanceof SsrfBlockedError) {
-      res.status(err.statusCode).json({ error: message });
+    const blockedNavMessage = routeFilterHolder.getBlockedError?.();
+    if (blockedNavMessage) {
+      res.status(403).json({ error: blockedNavMessage });
       return;
     }
-    if (timedOut || /timeout/i.test(message)) {
+    const rawMessage = err instanceof Error ? err.message : 'Unable to capture website.';
+    if (err instanceof SsrfBlockedError) {
+      res.status(err.statusCode).json({ error: rawMessage });
+      return;
+    }
+    if (timedOut || /timeout/i.test(rawMessage)) {
       res.status(504).json({
         error:
           'Capture timed out while loading the website. The site may be slow or blocking automated access.',
       });
       return;
     }
-    res.status(422).json({ error: message });
+    res.status(422).json({ error: sanitizePlaywrightNavigationError(rawMessage) });
   } finally {
     if (deadlineHandle) clearTimeout(deadlineHandle);
     activeCaptureCount = Math.max(0, activeCaptureCount - 1);
@@ -519,10 +560,14 @@ app.use(
   }
 );
 
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
+});
+
 async function startServer() {
-  if (process.env.NODE_ENV === 'production' && !CAPTURE_TOKEN) {
+  if (process.env.NODE_ENV === 'production' && CAPTURE_TOKEN.length < 32) {
     console.error(
-      'ERROR: CAPTURE_TOKEN must be set when NODE_ENV=production. Refusing to start without API authentication.'
+      'ERROR: CAPTURE_TOKEN must be at least 32 characters when NODE_ENV=production (e.g. `openssl rand -hex 32`). Refusing to start without strong API authentication.'
     );
     process.exit(1);
   }

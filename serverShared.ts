@@ -68,12 +68,16 @@ function parseIpv6ToWords(ip: string): number[] | null {
 
 function isPrivateIpv4(ip: string): boolean {
   if (!net.isIPv4(ip)) return false;
-  const [a, b] = ip.split('.').map(Number);
+  const [a, b, c] = ip.split('.').map(Number);
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 169 && b === 254) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24 IETF + 192.0.2.0/24 TEST-NET-1
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
   if (a >= 224) return true; // multicast + reserved 240/4
   return false;
 }
@@ -89,7 +93,8 @@ export function isPrivateOrBlockedIp(rawIp: string): boolean {
   }
 
   const words = parseIpv6ToWords(ip);
-  if (!words) return false;
+  // Fail closed when an IPv6 or unknown IP string cannot be parsed
+  if (!words) return true;
 
   // :: (unspecified) and ::1 (loopback)
   const prefixZero = words[0] === 0 && words[1] === 0 && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0;
@@ -113,6 +118,27 @@ export function isPrivateOrBlockedIp(rawIp: string): boolean {
   if (prefixZero && (words[6] !== 0 || words[7] > 1)) {
     return isPrivateIpv4(wordsToIpv4(words[6], words[7]));
   }
+
+  // NAT64 well-known prefix 64:ff9b::/96 (0064:ff9b:0000:0000:0000:0000::/96)
+  if (
+    words[0] === 0x0064 &&
+    words[1] === 0xff9b &&
+    words[2] === 0 &&
+    words[3] === 0 &&
+    words[4] === 0 &&
+    words[5] === 0
+  ) {
+    return true;
+  }
+
+  // 6to4 2002::/16
+  if (words[0] === 0x2002) return true;
+
+  // Teredo 2001::/32
+  if (words[0] === 0x2001 && words[1] === 0x0000) return true;
+
+  // Documentation 2001:db8::/32
+  if (words[0] === 0x2001 && words[1] === 0x0db8) return true;
 
   // Unique local fc00::/7
   if ((words[0] & 0xfe00) === 0xfc00) return true;
@@ -251,6 +277,60 @@ export function parseAllowedRelayHosts(rawEnv?: string): Set<string> {
 export function isAllowedRelayHost(hostname: string, allowedHosts: Set<string>): boolean {
   const clean = stripIpv6Brackets(hostname).toLowerCase();
   return allowedHosts.has(clean);
+}
+
+export function validateRelayUrlBeforeDns(rawUrl: string, allowedHosts: Set<string>): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw Object.assign(new Error('Invalid target API URL.'), { statusCode: 400 });
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new SsrfBlockedError('Relay only allows HTTPS external API endpoints.', 403);
+  }
+
+  if (!isAllowedRelayHost(parsed.hostname, allowedHosts)) {
+    throw new SsrfBlockedError(
+      `Relay target host "${parsed.hostname}" is not in RELAY_ALLOWED_HOSTS.`,
+      403
+    );
+  }
+
+  return parsed;
+}
+
+export function sanitizePlaywrightNavigationError(rawMessage: string): string {
+  if (/net::ERR_ACCESS_DENIED/i.test(rawMessage)) {
+    return 'Access to the target website was blocked by security policy.';
+  }
+  if (/net::ERR_NAME_NOT_RESOLVED/i.test(rawMessage)) {
+    return 'Could not resolve that website domain. Check the URL spelling and try again.';
+  }
+  if (
+    /net::ERR_CONNECTION_REFUSED|net::ERR_CONNECTION_RESET|net::ERR_CONNECTION_CLOSED|net::ERR_CONNECTION_ABORTED/i.test(
+      rawMessage
+    )
+  ) {
+    return 'The target website refused or closed the connection.';
+  }
+  if (/net::ERR_CONNECTION_TIMED_OUT|net::ERR_TIMED_OUT/i.test(rawMessage)) {
+    return 'The target website took too long to respond.';
+  }
+  if (/net::ERR_CERT_|net::ERR_SSL_/i.test(rawMessage)) {
+    return 'The target website has an invalid or untrusted SSL certificate.';
+  }
+  if (/net::ERR_TOO_MANY_REDIRECTS/i.test(rawMessage)) {
+    return 'The target website redirected too many times.';
+  }
+  if (/net::ERR_HTTP_RESPONSE_CODE_FAILURE|net::ERR_INVALID_RESPONSE/i.test(rawMessage)) {
+    return 'The target website returned an invalid response.';
+  }
+  if (/net::ERR_/i.test(rawMessage)) {
+    return 'Unable to load the target website due to a network error.';
+  }
+  return rawMessage || 'Unable to capture website.';
 }
 
 export class SlidingWindowRateLimiter {

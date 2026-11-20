@@ -23,7 +23,13 @@ import {
   inspectHtmlContent,
   parseHtmlWithCheerio,
 } from './htmlFindings';
-import { resolveHtmlContentAndFindings } from '../../serverAudit';
+import {
+  AuditJobSkippedError,
+  MAX_AUDIT_PENDING,
+  enqueueAudit,
+  executeFullSiteAudit,
+  resolveHtmlContentAndFindings,
+} from '../../serverAudit';
 import {
   buildOutreachSummary,
   computeIgnoredLeadsEstimate,
@@ -39,7 +45,10 @@ import {
   SsrfBlockedError,
   isBearerTokenValid,
   isPrivateOrBlockedIp,
+  parseAllowedRelayHosts,
+  sanitizePlaywrightNavigationError,
   validatePublicTargetUrl,
+  validateRelayUrlBeforeDns,
 } from '../../serverShared';
 
 function makeMinimalAudit(findings: AuditResult['findings']): AuditResult {
@@ -897,5 +906,123 @@ test('BATCH 2: host switch flags different domains while ignoring www and http->
   const parsedLegacy = AuditResultSchema.safeParse(legacyAudit);
   assert.equal(parsedLegacy.success, true);
 });
+
+test('BATCH 3: isPrivateOrBlockedIp blocks NAT64/6to4/Teredo/Doc IPv6, unparseable IPv6, and reserved IPv4 ranges while allowing public IPs', async () => {
+  const mustBlock = [
+    '64:ff9b::7f00:1',
+    '2002:a9fe:a9fe::',
+    '2001::1',
+    '2001:db8::1',
+    '198.18.0.1',
+    '198.19.255.254',
+    '192.0.0.1',
+    '192.0.2.1',
+    '198.51.100.1',
+    '203.0.113.1',
+    '2001:::1',
+    'not-an-ip-address',
+  ];
+  for (const ip of mustBlock) {
+    assert.equal(isPrivateOrBlockedIp(ip), true, `Expected ${ip} to be blocked`);
+  }
+
+  const mustAllow = ['8.8.8.8', '2606:4700::1111', '2606:4700:4700::1111'];
+  for (const ip of mustAllow) {
+    assert.equal(isPrivateOrBlockedIp(ip), false, `Expected ${ip} to be allowed`);
+  }
+
+  for (const url of [
+    'http://[64:ff9b::7f00:1]/',
+    'http://[2002:a9fe:a9fe::]/',
+    'http://198.18.0.1/',
+  ]) {
+    await assert.rejects(
+      () => validatePublicTargetUrl(url),
+      (err: unknown) => err instanceof SsrfBlockedError && err.statusCode === 403
+    );
+  }
+});
+
+test('BATCH 3: relay pre-DNS allowlist and Playwright net::ERR_* sanitization', () => {
+  const allowed = parseAllowedRelayHosts(undefined);
+  assert.throws(
+    () => validateRelayUrlBeforeDns('https://evil.internal/v1/chat', allowed),
+    (err: unknown) => err instanceof SsrfBlockedError && err.statusCode === 403
+  );
+  assert.throws(
+    () => validateRelayUrlBeforeDns('http://openrouter.ai/api/v1/models', allowed),
+    (err: unknown) => err instanceof SsrfBlockedError && err.statusCode === 403
+  );
+  const okUrl = validateRelayUrlBeforeDns('https://openrouter.ai/api/v1/models', allowed);
+  assert.equal(okUrl.hostname, 'openrouter.ai');
+
+  const sanitizedDns = sanitizePlaywrightNavigationError(
+    'page.goto: net::ERR_NAME_NOT_RESOLVED at https://missing.example/'
+  );
+  assert.equal(sanitizedDns.includes('net::ERR_'), false);
+  assert.ok(sanitizedDns.length > 10);
+
+  const sanitizedDenied = sanitizePlaywrightNavigationError('net::ERR_ACCESS_DENIED');
+  assert.equal(sanitizedDenied.includes('net::ERR_'), false);
+});
+
+test('BATCH 3: audit overall deadline returns partial results with timeout note, MAX_AUDIT_PENDING is 4, and disconnected job is skipped', async () => {
+  assert.equal(MAX_AUDIT_PENDING, 4);
+
+  const partial = await executeFullSiteAudit('https://slow-site.example/', {
+    deadlineMs: 60,
+    deps: {
+      validateUrl: async (u) => new URL(u),
+      fetchHtml: async (u) => {
+        if (u.endsWith('/robots.txt') || u.endsWith('/sitemap.xml')) {
+          return {
+            finalUrl: u,
+            statusCode: 200,
+            ttfbMs: 10,
+            bytes: 20,
+            text: 'User-agent: *\nAllow: /',
+            contentType: 'text/plain',
+          };
+        }
+        return {
+          finalUrl: 'https://slow-site.example/',
+          statusCode: 200,
+          ttfbMs: 120,
+          bytes: 500,
+          text: '<!doctype html><html lang="en"><head><title>Slow Example Resort Official</title></head><body><h1>Welcome</h1><a href="tel:+639171234567">Call us</a><p>Plenty of normal page text for testing partial deadline behavior accurately across steps.</p></body></html>',
+          contentType: 'text/html',
+        };
+      },
+      runSpeed: async (_u, signal) =>
+        await new Promise((resolve) => {
+          const timer = setTimeout(
+            () => resolve({ speed: null, reason: 'Completed late' }),
+            5000
+          );
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            resolve({ speed: null, reason: 'Audit took too long; partial results' });
+          });
+        }),
+    },
+  });
+
+  assert.equal(partial.httpStatus, 200);
+  assert.equal(partial.findings.find((f) => f.id === 'contact-tel')?.status, 'pass');
+  assert.equal(partial.findings.find((f) => f.id === 'speed-lcp')?.status, 'unknown');
+  assert.equal(
+    partial.auditNotes?.some((n) => n.message === 'Audit took too long; partial results'),
+    true
+  );
+
+  await assert.rejects(
+    () =>
+      enqueueAudit('http://127.0.0.1/', {
+        shouldSkip: () => true,
+      }),
+    (err: unknown) => err instanceof AuditJobSkippedError
+  );
+});
+
 
 

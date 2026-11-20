@@ -54,7 +54,7 @@ Copy `.env.example` to `.env` if needed:
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `PORT` | No | `3000` | Port the Express server listens on. |
-| `CAPTURE_TOKEN` | Yes in prod | `""` | Bearer token required on `/api/audit`, `/api/capture`, and `/api/relay` (server refuses to start in `NODE_ENV=production` if unset). |
+| `CAPTURE_TOKEN` | Yes in prod | `""` | Bearer token (>= 32 chars required when `NODE_ENV=production`; generate via `openssl rand -hex 32`) protecting `/api/audit`, `/api/capture`, and `/api/relay`. |
 | `PLAYWRIGHT_EXECUTABLE_PATH` | No | Auto-detected | Path to Chromium binary. Checked before `/usr/bin/chromium`, `/usr/bin/chromium-browser`, `/usr/bin/google-chrome-stable`, and `/ms-playwright/*`. |
 | `TRUST_PROXY` | No | `false` | Set `true` only behind a trusted reverse proxy (`app.set('trust proxy', 1)`) to honor `X-Forwarded-For` for rate limits. |
 | `RELAY_ALLOWED_HOSTS` | No | `openrouter.ai,integrate.api.nvidia.com` | Comma-separated hostnames allowed by `/api/relay`. Custom providers must be added here. |
@@ -170,14 +170,28 @@ Proxies the upstream JSON status and body directly:
 
 ---
 
-## Deploying Safely
+## Container hardening
 
-- **Always set `CAPTURE_TOKEN`** in production (`NODE_ENV=production` refuses to start if `CAPTURE_TOKEN` is blank). `/api/health` remains public for orchestrator liveness probes; `/api/audit`, `/api/capture`, and `/api/relay` all require `Authorization: Bearer <CAPTURE_TOKEN>`.
-- **Configure egress firewall rules** at the container, VPC, or host level to **block all outbound connections** to private and link-local ranges (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, plus IPv6 `::1`, `fc00::/7`, `fe80::/10`) before traffic leaves the runtime:
-  - **DNS rebinding protection**: Application-layer `validatePublicTargetUrl()` resolves DNS before `fetch()` or Chromium initiates a TCP socket. An attacker-controlled domain with a `TTL=0` DNS record can return a public IP during pre-flight lookup and flip to `127.0.0.1` or `169.254.169.254` milliseconds later when the socket connects.
-  - **Headless browser & Lighthouse subrequests**: Although `/api/capture` intercepts requests with Playwright `page.route('**/*')` and validates final redirect URLs, full page loads and Lighthouse traces spawn Chromium network stacks, prefetches, redirects, and third-party subresources that are safest when confined by kernel/network-level egress rules.
-- **Reverse proxy trust**: Leave `TRUST_PROXY=false` unless running behind a single trusted reverse proxy that overwrites `X-Forwarded-For`.
-- **Add custom AI endpoints explicitly**: Set `RELAY_ALLOWED_HOSTS` (comma-separated) if using self-hosted or custom OpenAI-compatible provider domains.
+1. **Generate a strong bearer token** (`NODE_ENV=production` refuses to start if `CAPTURE_TOKEN` is shorter than 32 characters):
+   ```bash
+   export CAPTURE_TOKEN=$(openssl rand -hex 32)
+   ```
+2. **Run Docker with dropped capabilities, no privilege escalation, and memory/PID caps**:
+   ```bash
+   docker run --rm -p 3000:3000 \
+     --cap-drop ALL \
+     --security-opt no-new-privileges \
+     --memory 1500m \
+     --pids-limit 300 \
+     -e NODE_ENV=production \
+     -e PORT=3000 \
+     -e CAPTURE_TOKEN="$CAPTURE_TOKEN" \
+     tourforge-lite
+   ```
+3. **Egress firewall rules (IPv4 and IPv6)**: Block all outbound container/host traffic to private, reserved, transition, and link-local ranges before packets leave the runtime (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `192.0.0.0/24`, `192.0.2.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, and IPv6 `::1/128`, `::/128`, `::ffff:0:0/96`, `64:ff9b::/96`, `2002::/16`, `2001::/32`, `2001:db8::/32`, `fc00::/7`, `fe80::/10`, `ff00::/8`).
+   - Application-layer DNS lookup (`validatePublicTargetUrl`) validates resolved IPs before requests, while host/network egress rules block `TTL=0` DNS rebinding and any Chromium subrequests at the kernel level.
+4. **Reverse proxy timeouts & trust**: Set upstream read/send timeouts to `>= 180s` (above `/api/audit`'s 150s hard deadline so partial results return cleanly instead of proxy `504`). Keep `TRUST_PROXY=false` unless behind a single trusted reverse proxy that strips/sets `X-Forwarded-For`.
+5. **Custom AI endpoints**: Set `RELAY_ALLOWED_HOSTS` (comma-separated) if using custom OpenAI-compatible hosts beyond `openrouter.ai,integrate.api.nvidia.com`.
 
 ---
 

@@ -61,7 +61,13 @@ interface SafeFetchResult {
 
 export async function fetchWithSsrfProtection(
   initialUrl: string,
-  options: { timeoutMs?: number; maxBytes?: number; maxRedirects?: number; headersOnly?: boolean } = {}
+  options: {
+    timeoutMs?: number;
+    maxBytes?: number;
+    maxRedirects?: number;
+    headersOnly?: boolean;
+    signal?: AbortSignal;
+  } = {}
 ): Promise<SafeFetchResult> {
   const timeoutMs = options.timeoutMs ?? 15000;
   const maxBytes = options.maxBytes ?? 2 * 1024 * 1024;
@@ -71,9 +77,20 @@ export async function fetchWithSsrfProtection(
   let currentUrl = initialUrl;
   const controller = new AbortController();
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  if (options.signal) {
+    if (options.signal.aborted) {
+      controller.abort();
+    } else {
+      options.signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
 
   try {
     for (let hop = 0; hop <= maxRedirects; hop++) {
+      if (controller.signal.aborted) {
+        throw new Error('Request aborted.');
+      }
       await validatePublicTargetUrl(currentUrl);
       const startTime = Date.now();
       const response = await fetch(currentUrl, {
@@ -155,11 +172,16 @@ export async function fetchWithSsrfProtection(
     throw new Error('Too many redirects.');
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+      throw new Error(
+        options.signal?.aborted
+          ? 'Audit deadline reached.'
+          : `Request timed out after ${Math.round(timeoutMs / 1000)}s.`
+      );
     }
     throw err;
   } finally {
     clearTimeout(timeoutHandle);
+    options.signal?.removeEventListener('abort', onExternalAbort);
   }
 }
 
@@ -223,8 +245,12 @@ function formatSavings(ms?: number, bytes?: number): string {
 }
 
 async function runLighthouseAudit(
-  targetUrl: string
+  targetUrl: string,
+  signal?: AbortSignal
 ): Promise<{ speed: SpeedMetrics | null; reason: string | null }> {
+  if (signal?.aborted) {
+    return { speed: null, reason: 'Audit timed out before speed test completed.' };
+  }
   const executablePath = resolveChromiumExecutable();
   if (!executablePath) {
     return {
@@ -361,13 +387,25 @@ async function runLighthouseAudit(
       };
     })();
 
+    let onExternalAbort: (() => void) | null = null;
     const timeoutPromise = new Promise<SpeedMetrics>((_, reject) => {
       timeoutHandle = setTimeout(() => {
         reject(new Error('Speed audit timed out after 90 seconds.'));
       }, 90000);
+      if (signal) {
+        onExternalAbort = () => reject(new Error('Audit timed out before speed test completed.'));
+        if (signal.aborted) {
+          onExternalAbort();
+        } else {
+          signal.addEventListener('abort', onExternalAbort, { once: true });
+        }
+      }
     });
 
     const speed = await Promise.race([runPromise, timeoutPromise]);
+    if (onExternalAbort && signal) {
+      signal.removeEventListener('abort', onExternalAbort);
+    }
     return { speed, reason: null };
   } catch (err) {
     return {
@@ -410,22 +448,35 @@ export class AuditQueueFullError extends Error {
   }
 }
 
-const MAX_AUDIT_PENDING = 5;
+export class AuditJobSkippedError extends Error {
+  constructor(message = 'Client disconnected before audit started') {
+    super(message);
+  }
+}
+
+export const MAX_AUDIT_PENDING = 4;
+export const AUDIT_OVERALL_DEADLINE_MS = 150_000;
 let pendingAuditCount = 0;
 
-// Strict concurrency-1 queue for CPU-heavy Lighthouse audits (max 5 pending)
+// Strict concurrency-1 queue for CPU-heavy Lighthouse audits (max 4 pending)
 let auditQueueTail: Promise<unknown> = Promise.resolve();
 
-export function enqueueAudit(rawUrl: string): Promise<AuditResult> {
+export function enqueueAudit(
+  rawUrl: string,
+  options: { shouldSkip?: () => boolean; deadlineMs?: number } = {}
+): Promise<AuditResult> {
   if (pendingAuditCount >= MAX_AUDIT_PENDING) {
     return Promise.reject(new AuditQueueFullError());
   }
   pendingAuditCount++;
+  const runJob = () => {
+    if (options.shouldSkip?.()) {
+      return Promise.reject(new AuditJobSkippedError());
+    }
+    return executeFullSiteAudit(rawUrl, { deadlineMs: options.deadlineMs });
+  };
   const next = auditQueueTail
-    .then(
-      () => executeFullSiteAudit(rawUrl),
-      () => executeFullSiteAudit(rawUrl)
-    )
+    .then(runJob, runJob)
     .finally(() => {
       pendingAuditCount = Math.max(0, pendingAuditCount - 1);
     });
@@ -435,7 +486,13 @@ export function enqueueAudit(rawUrl: string): Promise<AuditResult> {
 
 const JS_SHELL_HARD_CAP_MS = 45_000;
 
-export async function renderPageWithPlaywright(targetUrl: string): Promise<string> {
+export async function renderPageWithPlaywright(
+  targetUrl: string,
+  signal?: AbortSignal
+): Promise<string> {
+  if (signal?.aborted) {
+    throw new Error('Audit timed out before page render completed.');
+  }
   const executablePath = resolveChromiumExecutable();
   if (!executablePath) {
     throw new Error('No Chromium found. Set PLAYWRIGHT_EXECUTABLE_PATH.');
@@ -443,6 +500,7 @@ export async function renderPageWithPlaywright(targetUrl: string): Promise<strin
 
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
   let deadlineHandle: ReturnType<typeof setTimeout> | null = null;
+  let onExternalAbort: (() => void) | null = null;
 
   const closeBrowserSafely = async () => {
     const active = browser;
@@ -458,6 +516,17 @@ export async function renderPageWithPlaywright(targetUrl: string): Promise<strin
         void closeBrowserSafely();
         reject(new Error('JavaScript page render timed out after 45 seconds.'));
       }, JS_SHELL_HARD_CAP_MS);
+      if (signal) {
+        onExternalAbort = () => {
+          void closeBrowserSafely();
+          reject(new Error('Audit timed out before page render completed.'));
+        };
+        if (signal.aborted) {
+          onExternalAbort();
+        } else {
+          signal.addEventListener('abort', onExternalAbort, { once: true });
+        }
+      }
     });
 
     const renderWork = async (): Promise<string> => {
@@ -499,6 +568,9 @@ export async function renderPageWithPlaywright(targetUrl: string): Promise<strin
     return await Promise.race([renderWork(), deadlinePromise]);
   } finally {
     if (deadlineHandle) clearTimeout(deadlineHandle);
+    if (onExternalAbort && signal) {
+      signal.removeEventListener('abort', onExternalAbort);
+    }
     await closeBrowserSafely();
   }
 }
@@ -717,11 +789,39 @@ export async function resolveHtmlContentAndFindings(
   };
 }
 
-export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult> {
+export interface ExecuteAuditOptions {
+  deadlineMs?: number;
+  deps?: {
+    validateUrl?: (url: string) => Promise<URL>;
+    fetchHtml?: (
+      url: string,
+      opts: { timeoutMs?: number; maxBytes?: number; maxRedirects?: number; headersOnly?: boolean; signal?: AbortSignal }
+    ) => Promise<SafeFetchResult>;
+    renderJs?: (url: string, signal?: AbortSignal) => Promise<string>;
+    runSpeed?: (
+      url: string,
+      signal?: AbortSignal
+    ) => Promise<{ speed: SpeedMetrics | null; reason: string | null }>;
+  };
+}
+
+export async function executeFullSiteAudit(
+  rawUrl: string,
+  options: ExecuteAuditOptions = {}
+): Promise<AuditResult> {
+  const deadlineMs = options.deadlineMs ?? AUDIT_OVERALL_DEADLINE_MS;
+  const validateUrl = options.deps?.validateUrl ?? validatePublicTargetUrl;
+  const fetchHtml = options.deps?.fetchHtml ?? fetchWithSsrfProtection;
+  const renderJs = options.deps?.renderJs ?? renderPageWithPlaywright;
+  const runSpeed = options.deps?.runSpeed ?? runLighthouseAudit;
+
   // SSRF checks throw SsrfBlockedError -> handled by Express as 403/400.
   // Dead/unreachable public domains return partial AuditResult (never 500).
-  const parsedInput = await validatePublicTargetUrl(rawUrl).catch((err) => {
-    if (err instanceof SsrfBlockedError || (err && typeof err === 'object' && 'statusCode' in err && Number((err as { statusCode: number }).statusCode) === 400)) {
+  const parsedInput = await validateUrl(rawUrl).catch((err) => {
+    if (
+      err instanceof SsrfBlockedError ||
+      (err && typeof err === 'object' && 'statusCode' in err && Number((err as { statusCode: number }).statusCode) === 400)
+    ) {
       throw err;
     }
     return { error: err instanceof Error ? err.message : 'Could not reach target domain.' };
@@ -762,177 +862,279 @@ export async function executeFullSiteAudit(rawUrl: string): Promise<AuditResult>
     });
   }
 
-  let finalUrl: string | null = parsedInput.toString();
-  let httpStatus: number | null = null;
-  let ttfbMs: number | null = null;
-  const ttfbSamplesMs: number[] = [];
-  let htmlBytes: number | null = null;
-  let isHttps: boolean | null = parsedInput.protocol === 'https:';
-  let fetchError: string | null = null;
-  let rawHtml = '';
+  const state: {
+    finalUrl: string | null;
+    httpStatus: number | null;
+    ttfbMs: number | null;
+    ttfbSamplesMs: number[];
+    htmlBytes: number | null;
+    isHttps: boolean | null;
+    fetchError: string | null;
+    rawHtml: string;
+    contentResolution: HtmlContentResolution | null;
+    robotsTxt: AuditResult['robotsTxt'];
+    sitemapXml: AuditResult['sitemapXml'];
+    speed: SpeedMetrics | null;
+    speedReason: string | null;
+  } = {
+    finalUrl: parsedInput.toString(),
+    httpStatus: null,
+    ttfbMs: null,
+    ttfbSamplesMs: [],
+    htmlBytes: null,
+    isHttps: parsedInput.protocol === 'https:',
+    fetchError: null,
+    rawHtml: '',
+    contentResolution: null,
+    robotsTxt: { exists: null, allowsIndexing: null },
+    sitemapXml: { exists: null },
+    speed: null,
+    speedReason: null,
+  };
 
-  try {
-    const pageResp = await fetchWithSsrfProtection(parsedInput.toString(), {
-      timeoutMs: 15000,
-      maxBytes: 2 * 1024 * 1024,
-      maxRedirects: 5,
-    });
-    finalUrl = pageResp.finalUrl;
-    httpStatus = pageResp.statusCode;
-    ttfbSamplesMs.push(pageResp.ttfbMs);
-    htmlBytes = pageResp.bytes;
-    isHttps = new URL(pageResp.finalUrl).protocol === 'https:';
-    rawHtml = pageResp.text;
+  const deadlineController = new AbortController();
+  let deadlineHandle: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
 
-    if (pageResp.statusCode >= 400) {
-      fetchError = `Website returned HTTP ${pageResp.statusCode}.`;
-    } else if (!pageResp.text.trim()) {
-      fetchError = 'Website returned an empty HTML document.';
-    }
-
-    // Measure 2 more sequential requests to the resolved endpoint (total 3 samples, discard nothing, median)
-    for (let i = 0; i < 2; i++) {
-      try {
-        const probeResp = await fetchWithSsrfProtection(finalUrl, {
-          timeoutMs: 10000,
-          maxRedirects: 5,
-          headersOnly: true,
-        });
-        ttfbSamplesMs.push(probeResp.ttfbMs);
-      } catch {
-        // Keep previously captured samples if an additional probe fails
-      }
-    }
-
-    if (ttfbSamplesMs.length > 0) {
-      const sorted = [...ttfbSamplesMs].sort((a, b) => a - b);
-      ttfbMs = Math.round(sorted[Math.floor(sorted.length / 2)]);
-    }
-  } catch (err) {
-    if (err instanceof SsrfBlockedError) {
-      throw err;
-    }
-    fetchError = err instanceof Error ? err.message : 'Unable to fetch target HTML.';
-  }
-
-  const contentResolution = await resolveHtmlContent({
-    requestedUrl: rawUrl,
-    finalUrl,
-    httpStatus,
-    html: rawHtml,
-    fetchError,
-    renderJsShell: renderPageWithPlaywright,
-  });
-
-  const isBlocked = contentResolution.contentSource === 'blocked';
-  const isSoft404 = contentResolution.auditNotes.some((n) => n.code === 'soft-404');
-
-  // Check robots.txt and sitemap.xml relative to final origin (skip when blocked by bot wall)
-  const originUrl = new URL(finalUrl || parsedInput.toString()).origin;
-  let robotsTxt: AuditResult['robotsTxt'] = { exists: null, allowsIndexing: null };
-  let sitemapXml: AuditResult['sitemapXml'] = { exists: null };
-
-  if (isBlocked) {
-    robotsTxt = { exists: null, allowsIndexing: null, reason: 'This site blocks automated checks' };
-    sitemapXml = { exists: null, reason: 'This site blocks automated checks' };
-  } else if (!fetchError || httpStatus !== null) {
-    try {
-      const robotsResp = await fetchWithSsrfProtection(`${originUrl}/robots.txt`, {
-        timeoutMs: 10000,
-        maxBytes: 512 * 1024,
-        maxRedirects: 3,
+  const buildResultFromState = (): AuditResult => {
+    const resolution = state.contentResolution;
+    const notes: AuditNote[] = [...(resolution?.auditNotes ?? [])];
+    if (timedOut) {
+      notes.push({
+        code: 'timeout',
+        message: 'Audit took too long; partial results',
       });
-      if (robotsResp.statusCode >= 200 && robotsResp.statusCode < 300 && !/<html/i.test(robotsResp.text)) {
-        robotsTxt = {
-          exists: true,
-          allowsIndexing: parseRobotsAllowsIndexing(robotsResp.text),
-        };
-      } else {
-        robotsTxt = { exists: false, allowsIndexing: true };
+    }
+
+    const contentError =
+      resolution?.contentError ??
+      (timedOut && !resolution ? 'Audit took too long; partial results' : null);
+
+    const robotsTxt: AuditResult['robotsTxt'] =
+      state.robotsTxt.exists === null && !state.robotsTxt.reason && timedOut
+        ? { ...state.robotsTxt, reason: 'Audit took too long; partial results' }
+        : state.robotsTxt;
+
+    const sitemapXml: AuditResult['sitemapXml'] =
+      state.sitemapXml.exists === null && !state.sitemapXml.reason && timedOut
+        ? { ...state.sitemapXml, reason: 'Audit took too long; partial results' }
+        : state.sitemapXml;
+
+    const speedReason =
+      state.speedReason ??
+      (state.speed === null && timedOut ? 'Audit took too long; partial results' : null);
+
+    const findings = buildAutomatedFindings({
+      isHttps: state.isHttps,
+      fetchError: state.fetchError,
+      contentError,
+      ttfbMs: state.ttfbMs,
+      ttfbSampleCount: state.ttfbSamplesMs.length,
+      parsed: resolution?.parsed ?? null,
+      robotsTxt,
+      sitemapXml,
+      speed: state.speed,
+      speedReason,
+    });
+
+    return AuditResultSchema.parse({
+      schemaVersion: '1.0',
+      requestedUrl: rawUrl,
+      finalUrl: state.finalUrl,
+      auditedAt: new Date().toISOString(),
+      httpStatus: state.httpStatus,
+      ttfbMs: state.ttfbMs,
+      ttfbSamplesMs: state.ttfbSamplesMs,
+      htmlBytes: state.htmlBytes,
+      isHttps: state.isHttps,
+      fetchError: state.fetchError,
+      contentSource: resolution?.contentSource ?? 'raw',
+      auditNotes: notes,
+      ...(resolution?.redirectedFromHost
+        ? { redirectedFromHost: resolution.redirectedFromHost }
+        : {}),
+      parsed: resolution?.parsed ?? null,
+      robotsTxt,
+      sitemapXml,
+      speed: state.speed,
+      speedReason,
+      findings,
+    });
+  };
+
+  const runPipeline = async (): Promise<AuditResult> => {
+    try {
+      const pageResp = await fetchHtml(parsedInput.toString(), {
+        timeoutMs: 15000,
+        maxBytes: 2 * 1024 * 1024,
+        maxRedirects: 5,
+        signal: deadlineController.signal,
+      });
+      state.finalUrl = pageResp.finalUrl;
+      state.httpStatus = pageResp.statusCode;
+      state.ttfbSamplesMs.push(pageResp.ttfbMs);
+      state.htmlBytes = pageResp.bytes;
+      state.isHttps = new URL(pageResp.finalUrl).protocol === 'https:';
+      state.rawHtml = pageResp.text;
+
+      if (pageResp.statusCode >= 400) {
+        state.fetchError = `Website returned HTTP ${pageResp.statusCode}.`;
+      } else if (!pageResp.text.trim()) {
+        state.fetchError = 'Website returned an empty HTML document.';
+      }
+
+      // Measure 2 more sequential requests to the resolved endpoint (total 3 samples, discard nothing, median)
+      for (let i = 0; i < 2; i++) {
+        if (deadlineController.signal.aborted) break;
+        try {
+          const probeResp = await fetchHtml(state.finalUrl, {
+            timeoutMs: 10000,
+            maxRedirects: 5,
+            headersOnly: true,
+            signal: deadlineController.signal,
+          });
+          state.ttfbSamplesMs.push(probeResp.ttfbMs);
+        } catch {
+          // Keep previously captured samples if an additional probe fails
+        }
+      }
+
+      if (state.ttfbSamplesMs.length > 0) {
+        const sorted = [...state.ttfbSamplesMs].sort((a, b) => a - b);
+        state.ttfbMs = Math.round(sorted[Math.floor(sorted.length / 2)]);
       }
     } catch (err) {
-      robotsTxt = {
+      if (err instanceof SsrfBlockedError) {
+        throw err;
+      }
+      if (!deadlineController.signal.aborted) {
+        state.fetchError = err instanceof Error ? err.message : 'Unable to fetch target HTML.';
+      }
+    }
+
+    if (deadlineController.signal.aborted) {
+      return buildResultFromState();
+    }
+
+    state.contentResolution = await resolveHtmlContent({
+      requestedUrl: rawUrl,
+      finalUrl: state.finalUrl,
+      httpStatus: state.httpStatus,
+      html: state.rawHtml,
+      fetchError: state.fetchError,
+      renderJsShell: (url) => renderJs(url, deadlineController.signal),
+    });
+
+    if (deadlineController.signal.aborted) {
+      return buildResultFromState();
+    }
+
+    const isBlocked = state.contentResolution.contentSource === 'blocked';
+    const isSoft404 = state.contentResolution.auditNotes.some((n) => n.code === 'soft-404');
+
+    // Check robots.txt and sitemap.xml relative to final origin (skip when blocked by bot wall)
+    const originUrl = new URL(state.finalUrl || parsedInput.toString()).origin;
+
+    if (isBlocked) {
+      state.robotsTxt = {
         exists: null,
         allowsIndexing: null,
-        reason: err instanceof Error ? err.message : 'Unable to check robots.txt',
+        reason: 'This site blocks automated checks',
       };
-    }
-
-    try {
-      const sitemapResp = await fetchWithSsrfProtection(`${originUrl}/sitemap.xml`, {
-        timeoutMs: 10000,
-        maxBytes: 2 * 1024 * 1024,
-        maxRedirects: 3,
-      });
-      const looksXml =
-        sitemapResp.statusCode >= 200 &&
-        sitemapResp.statusCode < 300 &&
-        (/<(urlset|sitemapindex)\b/i.test(sitemapResp.text) ||
-          /xml/i.test(sitemapResp.contentType));
-      sitemapXml = {
-        exists: looksXml,
-        reason: looksXml ? undefined : `No valid sitemap.xml (HTTP ${sitemapResp.statusCode})`,
-      };
-    } catch (err) {
-      sitemapXml = {
+      state.sitemapXml = {
         exists: null,
-        reason: err instanceof Error ? err.message : 'Unable to check sitemap.xml',
+        reason: 'This site blocks automated checks',
       };
+    } else if (!state.fetchError || state.httpStatus !== null) {
+      try {
+        const robotsResp = await fetchHtml(`${originUrl}/robots.txt`, {
+          timeoutMs: 10000,
+          maxBytes: 512 * 1024,
+          maxRedirects: 3,
+          signal: deadlineController.signal,
+        });
+        if (robotsResp.statusCode >= 200 && robotsResp.statusCode < 300 && !/<html/i.test(robotsResp.text)) {
+          state.robotsTxt = {
+            exists: true,
+            allowsIndexing: parseRobotsAllowsIndexing(robotsResp.text),
+          };
+        } else {
+          state.robotsTxt = { exists: false, allowsIndexing: true };
+        }
+      } catch (err) {
+        if (!deadlineController.signal.aborted) {
+          state.robotsTxt = {
+            exists: null,
+            allowsIndexing: null,
+            reason: err instanceof Error ? err.message : 'Unable to check robots.txt',
+          };
+        }
+      }
+
+      if (!deadlineController.signal.aborted) {
+        try {
+          const sitemapResp = await fetchHtml(`${originUrl}/sitemap.xml`, {
+            timeoutMs: 10000,
+            maxBytes: 2 * 1024 * 1024,
+            maxRedirects: 3,
+            signal: deadlineController.signal,
+          });
+          const looksXml =
+            sitemapResp.statusCode >= 200 &&
+            sitemapResp.statusCode < 300 &&
+            (/<(urlset|sitemapindex)\b/i.test(sitemapResp.text) ||
+              /xml/i.test(sitemapResp.contentType));
+          state.sitemapXml = {
+            exists: looksXml,
+            reason: looksXml ? undefined : `No valid sitemap.xml (HTTP ${sitemapResp.statusCode})`,
+          };
+        } catch (err) {
+          if (!deadlineController.signal.aborted) {
+            state.sitemapXml = {
+              exists: null,
+              reason: err instanceof Error ? err.message : 'Unable to check sitemap.xml',
+            };
+          }
+        }
+      }
+    } else {
+      state.robotsTxt = { exists: null, allowsIndexing: null, reason: state.fetchError };
+      state.sitemapXml = { exists: null, reason: state.fetchError };
     }
-  } else {
-    robotsTxt = { exists: null, allowsIndexing: null, reason: fetchError };
-    sitemapXml = { exists: null, reason: fetchError };
+
+    if (deadlineController.signal.aborted) {
+      return buildResultFromState();
+    }
+
+    // Run open-source Lighthouse if main HTML loaded cleanly and was not blocked/soft-404
+    if (isBlocked) {
+      state.speedReason = 'This site blocks automated checks';
+    } else if (isSoft404) {
+      state.speedReason = 'Skipped speed test because the page returned a soft 404.';
+    } else if (!state.fetchError && state.finalUrl) {
+      const lh = await runSpeed(state.finalUrl, deadlineController.signal);
+      if (!deadlineController.signal.aborted) {
+        state.speed = lh.speed;
+        state.speedReason = lh.reason;
+      }
+    } else {
+      state.speedReason = state.fetchError || 'Skipped speed test because main page did not load.';
+    }
+
+    return buildResultFromState();
+  };
+
+  try {
+    const deadlinePromise = new Promise<AuditResult>((resolve) => {
+      deadlineHandle = setTimeout(() => {
+        timedOut = true;
+        deadlineController.abort();
+        resolve(buildResultFromState());
+      }, deadlineMs);
+    });
+
+    return await Promise.race([runPipeline(), deadlinePromise]);
+  } finally {
+    if (deadlineHandle) clearTimeout(deadlineHandle);
   }
-
-  // Run open-source Lighthouse if main HTML loaded cleanly and was not blocked/soft-404
-  let speed: SpeedMetrics | null = null;
-  let speedReason: string | null = null;
-  if (isBlocked) {
-    speedReason = 'This site blocks automated checks';
-  } else if (isSoft404) {
-    speedReason = 'Skipped speed test because the page returned a soft 404.';
-  } else if (!fetchError && finalUrl) {
-    const lh = await runLighthouseAudit(finalUrl);
-    speed = lh.speed;
-    speedReason = lh.reason;
-  } else {
-    speedReason = fetchError || 'Skipped speed test because main page did not load.';
-  }
-
-  const findings = buildAutomatedFindings({
-    isHttps,
-    fetchError,
-    contentError: contentResolution.contentError,
-    ttfbMs,
-    ttfbSampleCount: ttfbSamplesMs.length,
-    parsed: contentResolution.parsed,
-    robotsTxt,
-    sitemapXml,
-    speed,
-    speedReason,
-  });
-
-  return AuditResultSchema.parse({
-    schemaVersion: '1.0',
-    requestedUrl: rawUrl,
-    finalUrl,
-    auditedAt: new Date().toISOString(),
-    httpStatus,
-    ttfbMs,
-    ttfbSamplesMs,
-    htmlBytes,
-    isHttps,
-    fetchError,
-    contentSource: contentResolution.contentSource,
-    auditNotes: contentResolution.auditNotes,
-    ...(contentResolution.redirectedFromHost
-      ? { redirectedFromHost: contentResolution.redirectedFromHost }
-      : {}),
-    parsed: contentResolution.parsed,
-    robotsTxt,
-    sitemapXml,
-    speed,
-    speedReason,
-    findings,
-  });
 }

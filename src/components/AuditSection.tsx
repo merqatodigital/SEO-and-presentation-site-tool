@@ -10,11 +10,15 @@ import {
   HelpCircle,
   Loader2,
   Printer,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
   XCircle,
 } from 'lucide-react';
+import { buildSecurityHeaderSnippets } from '../audit/githubReport';
 import { deriveClientName } from '../audit/htmlFindings';
 import { buildOutreachSummary, getRagLabel } from '../audit/scorecard';
+import { buildSecurityBadgeSnippet } from '../audit/securityFindings';
 import {
   AUDIT_CATEGORIES,
   AuditAssumptions,
@@ -141,6 +145,11 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
   const [findingsSort, setFindingsSort] = useState<'weight' | 'status' | 'category'>('weight');
   const [findingsAsc, setFindingsAsc] = useState(false);
   const [copiedOutreach, setCopiedOutreach] = useState(false);
+  const [secSnippetTab, setSecSnippetTab] = useState<
+    'vercel.json' | 'next.config.js' | '_headers' | 'nginx.conf'
+  >('vercel.json');
+  const [copiedSecSnippet, setCopiedSecSnippet] = useState(false);
+  const [copiedSecBadge, setCopiedSecBadge] = useState(false);
 
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tabs: Array<{ id: AuditTabId; label: string }> = [
@@ -217,6 +226,35 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
       await navigator.clipboard.writeText(text);
       setCopiedOutreach(true);
       window.setTimeout(() => setCopiedOutreach(false), 2000);
+    } catch {
+      // Ignore clipboard failures
+    }
+  };
+
+  const securitySnippets = useMemo(() => buildSecurityHeaderSnippets(audit), [audit]);
+
+  const handleCopySecuritySnippet = async () => {
+    const content = securitySnippets[secSnippetTab] || '';
+    if (!content) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedSecSnippet(true);
+      window.setTimeout(() => setCopiedSecSnippet(false), 2000);
+    } catch {
+      // Ignore clipboard failures
+    }
+  };
+
+  const handleCopySecurityBadge = async () => {
+    const html = buildSecurityBadgeSnippet(
+      resolvedClientName,
+      audit?.finalUrl || auditUrl || audit?.requestedUrl,
+      scorecard.securityScore?.score ?? null
+    );
+    try {
+      await navigator.clipboard.writeText(html);
+      setCopiedSecBadge(true);
+      window.setTimeout(() => setCopiedSecBadge(false), 2000);
     } catch {
       // Ignore clipboard failures
     }
@@ -737,7 +775,7 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
               </div>
             )}
 
-            {/* Five Category Bars */}
+            {/* Category Score Bars */}
             <div>
               <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
                 Category Scores (Weights sum to 100%)
@@ -798,6 +836,303 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
                 })}
               </div>
             </div>
+
+            {/* Passive Security & Headers Audit */}
+            {audit?.security && (
+              <div className="space-y-4 rounded-xl border border-slate-200 bg-slate-50/70 p-4 sm:p-5 dark:border-slate-800 dark:bg-slate-950/60">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-start gap-2.5">
+                    {audit.security.badgeEligible ? (
+                      <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    ) : (
+                      <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />
+                    )}
+                    <div>
+                      <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        Passive Security &amp; Headers
+                      </h4>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        Public headers, HTML, and TLS check only ·{' '}
+                        {audit.security.tls.isHttps ? 'HTTPS' : 'HTTP'}
+                        {audit.security.tls.protocol ? ` (${audit.security.tls.protocol})` : ''}
+                        {audit.security.tls.hstsEnabled
+                          ? ` · HSTS ${audit.security.tls.hstsMaxAge ?? ''}s`
+                          : ' · No HSTS'}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 tabular-nums">
+                    <span className="rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200">
+                      Score:{' '}
+                      {scorecard.securityScore &&
+                      !scorecard.securityScore.insufficientData &&
+                      scorecard.securityScore.score !== null
+                        ? `${scorecard.securityScore.score}/100`
+                        : 'Insufficient data'}
+                    </span>
+                    <span
+                      className={`rounded-md border px-2.5 py-1 text-xs font-semibold ${
+                        audit.security.highSeverityCount === 0
+                          ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/50 dark:text-emerald-300'
+                          : 'border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/50 dark:text-rose-300'
+                      }`}
+                    >
+                      {audit.security.highSeverityCount} high-severity
+                    </span>
+                  </div>
+                </div>
+
+                {/* Security Header Checks */}
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  {audit.security.headerChecks.map((hc) => {
+                    const meta = statusMeta(hc.status);
+                    return (
+                      <div
+                        key={hc.header}
+                        className="rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate font-mono text-[11px] font-semibold text-slate-900 dark:text-slate-100">
+                            {hc.header}
+                          </span>
+                          <span className={`inline-flex items-center gap-1 text-[11px] font-semibold shrink-0 ${meta.cls}`}>
+                            {meta.icon}
+                            <span>{meta.label}</span>
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[11px] leading-snug text-slate-600 dark:text-slate-400">
+                          {hc.detail}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Passive Sub-Check Metrics Strip */}
+                <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-5 tabular-nums">
+                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">Mixed Content</p>
+                    <p className="mt-0.5 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {audit.security.mixedContent.count} URL(s)
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">Cookies Flagged</p>
+                    <p className="mt-0.5 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {audit.security.cookies.total === 0
+                        ? 'None set'
+                        : `${audit.security.cookies.missingSecure.length} no-Secure · ${audit.security.cookies.missingHttpOnly.length} no-HttpOnly`}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">Exposed Secrets</p>
+                    <p className="mt-0.5 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {audit.security.secrets.count} pattern(s)
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">Exposure / Maps</p>
+                    <p className="mt-0.5 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {audit.security.exposureHints.count} hints · {audit.security.sourceMaps.count} .map
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">External Scripts</p>
+                    <p className="mt-0.5 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {audit.security.thirdPartyScripts.length} script(s)
+                    </p>
+                  </div>
+                </div>
+
+                {/* Third-Party Script Inventory */}
+                {audit.security.thirdPartyScripts.length > 0 && (
+                  <div className="rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                    <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      Third-Party Script Inventory ({audit.security.thirdPartyScripts.length})
+                    </p>
+                    <div className="mt-2 max-h-36 overflow-y-auto divide-y divide-slate-100 text-[11px] dark:divide-slate-800">
+                      {audit.security.thirdPartyScripts.map((script) => (
+                        <div
+                          key={script.src}
+                          className="flex flex-wrap items-center justify-between gap-2 py-1.5"
+                        >
+                          <div className="min-w-0 truncate">
+                            <span className="font-semibold text-slate-800 dark:text-slate-200">
+                              {script.library || script.host}
+                            </span>
+                            {script.version && (
+                              <span className="ml-1.5 font-mono text-slate-500 dark:text-slate-400">
+                                v{script.version}
+                              </span>
+                            )}
+                            <span className="ml-2 text-slate-400 dark:text-slate-500">
+                              ({script.host})
+                            </span>
+                          </div>
+                          <span
+                            className={`font-medium shrink-0 ${
+                              script.hasSri
+                                ? 'text-emerald-700 dark:text-emerald-400'
+                                : 'text-amber-700 dark:text-amber-400'
+                            }`}
+                          >
+                            {script.hasSri ? 'SRI pinned' : 'No SRI'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Embeddable "Security Passed" Badge (shown when 0 high-severity findings & headers checked) */}
+                {audit.security.badgeEligible && (
+                  <div className="flex flex-col gap-3 rounded-lg border border-emerald-200 bg-emerald-50/70 p-3.5 sm:flex-row sm:items-center sm:justify-between dark:border-emerald-900/60 dark:bg-emerald-950/40">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="248"
+                        height="36"
+                        role="img"
+                        aria-label={`Security Passed - ${resolvedClientName}`}
+                        className="shrink-0"
+                      >
+                        <rect width="248" height="36" rx="6" fill="#0F172A" />
+                        <rect
+                          x="1"
+                          y="1"
+                          width="246"
+                          height="34"
+                          rx="5"
+                          fill="none"
+                          stroke="#10B981"
+                          strokeWidth="1.5"
+                        />
+                        <circle cx="20" cy="18" r="7" fill="#10B981" />
+                        <path
+                          d="M16.8 18.2l2.1 2.1 4.3-4.5"
+                          fill="none"
+                          stroke="#FFFFFF"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                        <text
+                          x="35"
+                          y="16"
+                          fill="#F8FAFC"
+                          fontFamily="system-ui,-apple-system,sans-serif"
+                          fontSize="11"
+                          fontWeight="700"
+                        >
+                          Security Passed
+                        </text>
+                        <text
+                          x="35"
+                          y="28"
+                          fill="#94A3B8"
+                          fontFamily="system-ui,-apple-system,sans-serif"
+                          fontSize="9.5"
+                        >
+                          {resolvedClientName.slice(0, 26)}
+                        </text>
+                        <rect x="188" y="8" width="50" height="20" rx="4" fill="#065F46" />
+                        <text
+                          x="213"
+                          y="21.5"
+                          textAnchor="middle"
+                          fill="#D1FAE5"
+                          fontFamily="ui-monospace,monospace"
+                          fontSize="10.5"
+                          fontWeight="700"
+                        >
+                          {scorecard.securityScore &&
+                          !scorecard.securityScore.insufficientData &&
+                          scorecard.securityScore.score !== null
+                            ? `${scorecard.securityScore.score}/100`
+                            : 'PASS'}
+                        </text>
+                      </svg>
+                      <p className="text-xs text-emerald-900 dark:text-emerald-200">
+                        Zero high-severity passive issues detected. Site owner can embed this badge.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleCopySecurityBadge()}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-white px-3 py-1.5 text-xs font-semibold text-emerald-900 hover:bg-emerald-50 dark:border-emerald-800 dark:bg-slate-900 dark:text-emerald-200 whitespace-nowrap shrink-0"
+                    >
+                      {copiedSecBadge ? (
+                        <>
+                          <Check className="h-3.5 w-3.5 text-emerald-600" />
+                          <span>Badge HTML copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3.5 w-3.5" />
+                          <span>Copy embed HTML</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
+
+                {/* Ready-to-Commit Security Header Snippets */}
+                {(audit.security.highSeverityCount > 0 ||
+                  audit.security.headerChecks.some((h) => h.status === 'fail' || h.status === 'warn')) && (
+                  <div className="rounded-lg border border-slate-200 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                          Ready-to-Commit Security Header Snippets
+                        </p>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Drop into the target repo to resolve missing or weak HTTP security headers.
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1">
+                        {(['vercel.json', 'next.config.js', '_headers', 'nginx.conf'] as const).map(
+                          (tabKey) => (
+                            <button
+                              key={tabKey}
+                              type="button"
+                              onClick={() => setSecSnippetTab(tabKey)}
+                              className={`rounded px-2 py-1 font-mono text-[11px] font-semibold transition-colors ${
+                                secSnippetTab === tabKey
+                                  ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
+                                  : 'bg-slate-100 text-slate-600 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-300'
+                              }`}
+                            >
+                              {tabKey}
+                            </button>
+                          )
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void handleCopySecuritySnippet()}
+                          className="ml-1 inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"
+                        >
+                          {copiedSecSnippet ? (
+                            <>
+                              <Check className="h-3 w-3 text-emerald-600" />
+                              <span>Copied</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="h-3 w-3" />
+                              <span>Copy</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                    <pre className="mt-2.5 max-h-44 overflow-auto rounded-md bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-100">
+                      {securitySnippets[secSnippetTab]}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Top 5 Fix First + Ignored Leads Grid */}
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">

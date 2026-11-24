@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import tls from 'node:tls';
 import { spawn } from 'node:child_process';
 import lighthouse from 'lighthouse';
 import { chromium } from 'playwright-core';
@@ -24,6 +25,10 @@ import {
   inspectHtmlContent,
   parseHtmlWithCheerio,
 } from './src/audit/htmlFindings.ts';
+import {
+  PassiveTlsInfo,
+  analyzePassiveSecurity,
+} from './src/audit/securityFindings.ts';
 import {
   AiReadinessResult,
   AuditFinding,
@@ -63,6 +68,8 @@ interface SafeFetchResult {
   bytes: number;
   text: string;
   contentType: string;
+  headers?: Record<string, string>;
+  setCookies?: string[];
 }
 
 export async function fetchWithSsrfProtection(
@@ -125,6 +132,19 @@ export async function fetchWithSsrfProtection(
 
       const ttfbMs = Date.now() - startTime;
       const contentType = response.headers.get('content-type') || '';
+      const capturedHeaders: Record<string, string> = {};
+      response.headers.forEach((value, key) => {
+        capturedHeaders[key.toLowerCase()] = value;
+      });
+      const getSetCookie = (
+        response.headers as unknown as { getSetCookie?: () => string[] }
+      ).getSetCookie;
+      const setCookies =
+        typeof getSetCookie === 'function'
+          ? getSetCookie.call(response.headers)
+          : capturedHeaders['set-cookie']
+          ? [capturedHeaders['set-cookie']]
+          : [];
 
       if (headersOnly) {
         await response.body?.cancel().catch(() => {});
@@ -135,6 +155,8 @@ export async function fetchWithSsrfProtection(
           bytes: 0,
           text: '',
           contentType,
+          headers: capturedHeaders,
+          setCookies,
         };
       }
 
@@ -172,6 +194,8 @@ export async function fetchWithSsrfProtection(
         bytes: totalBytes,
         text,
         contentType,
+        headers: capturedHeaders,
+        setCookies,
       };
     }
 
@@ -795,6 +819,78 @@ export async function resolveHtmlContentAndFindings(
   };
 }
 
+async function probePassiveTlsInfo(
+  targetUrl: string,
+  signal?: AbortSignal
+): Promise<PassiveTlsInfo | null> {
+  if (signal?.aborted) return null;
+  let parsed: URL;
+  try {
+    parsed = await validatePublicTargetUrl(targetUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:') return null;
+
+  const port = parsed.port ? Number(parsed.port) : 443;
+  return await new Promise<PassiveTlsInfo | null>((resolve) => {
+    let settled = false;
+    const done = (val: PassiveTlsInfo | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    };
+
+    const socket = tls.connect(
+      {
+        host: parsed.hostname,
+        port,
+        servername: parsed.hostname,
+        rejectUnauthorized: true,
+        timeout: 3500,
+      },
+      () => {
+        try {
+          const protocol = socket.getProtocol() ?? null;
+          const cipher = socket.getCipher()?.name ?? null;
+          const cert = socket.getPeerCertificate();
+          const validTo = cert?.valid_to ? String(cert.valid_to) : null;
+          done({
+            protocol,
+            cipher,
+            certificateValid: socket.authorized,
+            validTo,
+          });
+        } catch {
+          done(null);
+        } finally {
+          socket.end();
+        }
+      }
+    );
+
+    const onAbort = () => {
+      socket.destroy();
+      done(null);
+    };
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    socket.on('timeout', () => {
+      socket.destroy();
+      done(null);
+    });
+    socket.on('error', () => {
+      socket.destroy();
+      done(null);
+    });
+    socket.on('close', () => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
+
 export interface ExecuteAuditOptions {
   deadlineMs?: number;
   deps?: {
@@ -808,6 +904,7 @@ export interface ExecuteAuditOptions {
       url: string,
       signal?: AbortSignal
     ) => Promise<{ speed: SpeedMetrics | null; reason: string | null }>;
+    probeTls?: (url: string, signal?: AbortSignal) => Promise<PassiveTlsInfo | null>;
   };
 }
 
@@ -877,6 +974,10 @@ export async function executeFullSiteAudit(
     isHttps: boolean | null;
     fetchError: string | null;
     rawHtml: string;
+    headers: Record<string, string>;
+    setCookies: string[];
+    headersChecked: boolean;
+    tlsInfo: PassiveTlsInfo | null;
     contentResolution: HtmlContentResolution | null;
     robotsTxt: AuditResult['robotsTxt'];
     robotsContent: string | null;
@@ -893,6 +994,10 @@ export async function executeFullSiteAudit(
     isHttps: parsedInput.protocol === 'https:',
     fetchError: null,
     rawHtml: '',
+    headers: {},
+    setCookies: [],
+    headersChecked: false,
+    tlsInfo: null,
     contentResolution: null,
     robotsTxt: { exists: null, allowsIndexing: null },
     robotsContent: null,
@@ -935,7 +1040,7 @@ export async function executeFullSiteAudit(
       (state.speed === null && timedOut ? 'Audit took too long; partial results' : null);
 
     const parsedFacts = resolution?.parsed ?? null;
-    const findings = buildAutomatedFindings({
+    const baseFindings = buildAutomatedFindings({
       isHttps: state.isHttps,
       fetchError: state.fetchError,
       contentError,
@@ -947,6 +1052,20 @@ export async function executeFullSiteAudit(
       speed: state.speed,
       speedReason,
     });
+
+    const security = analyzePassiveSecurity({
+      finalUrl: state.finalUrl,
+      isHttps: state.isHttps,
+      html: state.rawHtml,
+      headers: state.headers,
+      setCookies: state.setCookies,
+      robotsTxtContent: state.robotsContent,
+      tlsInfo: state.tlsInfo,
+      headersChecked: state.headersChecked,
+      contentBlocked: resolution?.contentSource === 'blocked',
+    });
+
+    const findings: AuditFinding[] = [...baseFindings, ...security.findings];
 
     const aiReadiness: AiReadinessResult = {
       robotsChecked: robotsTxt.exists !== null,
@@ -978,6 +1097,7 @@ export async function executeFullSiteAudit(
         ? { redirectedFromHost: resolution.redirectedFromHost }
         : {}),
       aiReadiness,
+      security,
       parsed: parsedFacts,
       robotsTxt,
       sitemapXml,
@@ -1001,11 +1121,25 @@ export async function executeFullSiteAudit(
       state.htmlBytes = pageResp.bytes;
       state.isHttps = new URL(pageResp.finalUrl).protocol === 'https:';
       state.rawHtml = pageResp.text;
+      state.headers = pageResp.headers ?? {};
+      state.setCookies = pageResp.setCookies ?? [];
+      state.headersChecked = Boolean(pageResp.headers);
 
       if (pageResp.statusCode >= 400) {
         state.fetchError = `Website returned HTTP ${pageResp.statusCode}.`;
       } else if (!pageResp.text.trim()) {
         state.fetchError = 'Website returned an empty HTML document.';
+      }
+
+      // Passive single-endpoint TLS metadata inspection (only for resolved HTTPS endpoint, zero port scanning)
+      if (state.isHttps && state.finalUrl && !deadlineController.signal.aborted) {
+        const tlsProbeFn =
+          options.deps?.probeTls ?? (options.deps?.fetchHtml ? null : probePassiveTlsInfo);
+        if (tlsProbeFn) {
+          state.tlsInfo = await tlsProbeFn(state.finalUrl, deadlineController.signal).catch(
+            () => null
+          );
+        }
       }
 
       // Measure 2 more sequential requests to the resolved endpoint (total 3 samples, discard nothing, median)

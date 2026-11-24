@@ -26,7 +26,7 @@ curl -s http://127.0.0.1:3000/api/health
 
 ---
 
-## 2. MCP Setup for OpenCode & Hermes Agent
+## 2. MCP Setup for OpenCode, Hermes Agent & Maus
 
 TourForge Lite includes a zero-dependency **MCP (Model Context Protocol)** server over stdio (`npm run mcp`). It works either **in-process** (using local Chromium) or **against your shared server** when `TOURFORGE_SERVER_URL` is set.
 
@@ -63,13 +63,30 @@ mcp_servers:
       CAPTURE_TOKEN: YOUR_CAPTURE_TOKEN
 ```
 
+### Example Maus custom-MCP config
+
+```json
+{
+  "mcpServers": {
+    "tourforge": {
+      "command": "npx",
+      "args": ["tsx", "/ABS/PATH/TO/tourforge-lite/scripts/mcp-server.ts"],
+      "env": {
+        "TOURFORGE_SERVER_URL": "https://your-internal-tourforge-host",
+        "CAPTURE_TOKEN": "YOUR_CAPTURE_TOKEN"
+      }
+    }
+  }
+}
+```
+
 ### Exposed MCP Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `tourforge_audit_url` | Runs `/api/audit` (or local `enqueueAudit`), computes deterministic `Scorecard`, `AiReadinessSummary`, and `RepoFileChangeAction[]`. |
+| `tourforge_audit_url` | Runs `/api/audit` (or local `enqueueAudit`), computes deterministic `Scorecard` (including `scorecard.securityScore`), `AiReadinessSummary`, `security` (`PassiveSecurityAudit` with TLS, headers, mixed content, cookies, redacted secrets, source maps, third-party scripts, form/CSRF hints), `securityBadge` (`{ eligible, htmlSnippet, svg }`), and `RepoFileChangeAction[]`. |
 | `tourforge_capture_site` | Captures 3–6 desktop screenshots and visible DOM facts via `/api/capture`. |
-| `tourforge_generate_repo_fixes` | Produces ready-to-commit `public/robots.txt`, `public/llms.txt`, `<script type="application/ld+json">`, and a GitHub Issue checklist. |
+| `tourforge_generate_repo_fixes` | Produces ready-to-commit `public/robots.txt`, `public/llms.txt`, `<script type="application/ld+json">`, security header configs (`vercel.json`, `next.config.js`, `_headers`, `nginx.conf`), `security-badge.html` (when `badgeEligible` is true), and a GitHub Issue checklist. |
 | `tourforge_export_bundle` | Outputs a complete `tourforge-bundle.json` file that any teammate can import via **Import JSON** in the TourForge Lite UI. |
 
 ---
@@ -90,10 +107,12 @@ npm run audit:cli -- \
 ```
 
 Outputs created in `./audits/client-slug/`:
-- `report.md` — Full deterministic Scorecard, category scores, AI readiness metrics, and mapped repo changes (`[P0]` / `[P1]` / `[P2]`).
-- `github-issue.md` — Ready-to-post GitHub Issue / PR comment body with file paths and checkboxes.
+- `report.md` — Full deterministic Scorecard, category scores (including `Passive Security & Headers` at 10% weight), AI readiness metrics, `## Passive Security & Headers Audit` table, and mapped repo changes (`[P0]` / `[P1]` / `[P2]`).
+- `github-issue.md` — Ready-to-post GitHub Issue / PR comment body with passive security score, file paths, and checkboxes.
 - `tourforge-bundle.json` — Valid `FullProjectBundle` JSON importable directly into the TourForge Lite UI (**Step 1 → Import JSON**).
-- `generated/robots.txt`, `generated/llms.txt`, `generated/schema.jsonld` — Ready-to-commit snippets for a draft PR.
+- `generated/robots.txt`, `generated/llms.txt`, `generated/schema.jsonld` — Ready-to-commit SEO/AI snippets for a draft PR.
+- `generated/security-headers/{vercel.json,next.config.js,_headers,nginx.conf}` — Ready-to-commit HTTP security header configs tailored to missing/weak headers.
+- `generated/security-badge.html` & `generated/security-badge.svg` — Embeddable `"Security Passed"` trust badge emitted automatically when `badgeEligible === true` (headers checked and zero high-severity passive findings).
 
 Add `--ai` (with `OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, or `OLLAMA_URL`) to also append an agent-written **Executive Narrative** verified by numeric grounding.
 

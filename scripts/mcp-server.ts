@@ -178,6 +178,13 @@ export async function handleMcpToolCall(
       manual,
       assumptions,
     });
+    const assets = buildGeneratedRepoAssets(
+      bundle.project,
+      bundle.aiSearchLayer!,
+      audit,
+      manual,
+      scorecard.securityScore?.score ?? null
+    );
     const markdown = buildAgentMarkdownReport({
       url,
       repoName: typeof args.repoName === 'string' ? args.repoName : undefined,
@@ -201,6 +208,13 @@ export async function handleMcpToolCall(
                 grade: scorecard.grade,
                 isProvisional: scorecard.isProvisional,
                 dataCompletenessPct: scorecard.dataCompletenessPct,
+                securityScore: scorecard.securityScore ?? null,
+              },
+              security: audit.security ?? null,
+              securityBadge: {
+                eligible: Boolean(audit.security?.badgeEligible),
+                htmlSnippet: assets.securityBadgeHtml,
+                svg: assets.securityBadgeSvg,
               },
               aiReadiness: aiSummary,
               repoChanges,
@@ -268,7 +282,8 @@ export async function handleMcpToolCall(
       bundle.project,
       bundle.aiSearchLayer!,
       audit,
-      manual
+      manual,
+      scorecard.securityScore?.score ?? null
     );
     const githubIssueMarkdown = buildGitHubIssueBody({
       url: resolvedUrl,
@@ -290,6 +305,13 @@ export async function handleMcpToolCall(
                 'public/robots.txt': assets.robotsTxt,
                 'public/llms.txt': assets.llmsTxt,
                 'schema.jsonld': assets.schemaJsonLdTag,
+                'vercel.json': assets.securitySnippets['vercel.json'],
+                'next.config.js': assets.securitySnippets['next.config.js'],
+                '_headers': assets.securitySnippets['_headers'],
+                'nginx.conf': assets.securitySnippets['nginx.conf'],
+                ...(assets.securityBadgeHtml
+                  ? { 'security-badge.html': assets.securityBadgeHtml }
+                  : {}),
               },
             },
             null,

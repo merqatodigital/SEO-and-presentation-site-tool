@@ -126,7 +126,7 @@ export const PrintScorecardView: React.FC<PrintScorecardViewProps> = ({
         </div>
       )}
 
-      {/* 5 Category Bars */}
+      {/* Category Bars */}
       <div className="mt-3.5">
         <h2 className="text-xs font-bold tracking-wide text-slate-800">
           Category Breakdown (Weights total 100%)
@@ -251,6 +251,20 @@ export const PrintScorecardView: React.FC<PrintScorecardViewProps> = ({
           {aiSummary.score !== null && (
             <p className="mt-1 border-t border-slate-100 pt-1 text-[9px] font-medium text-slate-600 tabular-nums">
               AI Search Readiness: {aiSummary.score}/100 ({aiSummary.allowedBotsCount}/{aiSummary.totalBotsCount} bots · {aiSummary.entityFieldsPresent}/8 schema)
+            </p>
+          )}
+          {audit?.security && (
+            <p className="mt-1 border-t border-slate-100 pt-1 text-[9px] font-medium text-slate-600 tabular-nums">
+              Passive Security:{' '}
+              {scorecard.securityScore &&
+              !scorecard.securityScore.insufficientData &&
+              scorecard.securityScore.score !== null
+                ? `${scorecard.securityScore.score}/100`
+                : 'Insufficient data'}{' '}
+              · {audit.security.highSeverityCount} high-severity ·{' '}
+              {audit.security.tls.isHttps ? 'HTTPS' : 'HTTP'}
+              {audit.security.tls.hstsEnabled ? ' + HSTS' : ''}
+              {audit.security.badgeEligible ? ' · Security Passed badge eligible' : ''}
             </p>
           )}
         </div>

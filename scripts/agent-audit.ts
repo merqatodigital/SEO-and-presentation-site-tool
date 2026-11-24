@@ -265,11 +265,13 @@ Options:
   });
 
   const repoChanges = buildRepoChangeChecklist(audit, aiSummary);
+  const secScoreVal = scorecard.securityScore?.score ?? null;
   const assets = buildGeneratedRepoAssets(
     finalBundle.project,
     finalBundle.aiSearchLayer!,
     audit,
-    manual
+    manual,
+    secScoreVal
   );
 
   const markdownReport = buildAgentMarkdownReport({
@@ -297,15 +299,27 @@ Options:
   if (parsed.outDir) {
     const outAbs = path.resolve(parsed.outDir);
     const genDir = path.join(outAbs, 'generated');
-    await fs.mkdir(genDir, { recursive: true });
-    await Promise.all([
+    const secDir = path.join(genDir, 'security-headers');
+    await fs.mkdir(secDir, { recursive: true });
+    const writes: Promise<void>[] = [
       fs.writeFile(path.join(outAbs, 'tourforge-bundle.json'), JSON.stringify(finalBundle, null, 2), 'utf8'),
       fs.writeFile(path.join(outAbs, 'report.md'), markdownReport, 'utf8'),
       fs.writeFile(path.join(outAbs, 'github-issue.md'), githubIssueMd, 'utf8'),
       fs.writeFile(path.join(genDir, 'robots.txt'), assets.robotsTxt + '\n', 'utf8'),
       fs.writeFile(path.join(genDir, 'llms.txt'), assets.llmsTxt + '\n', 'utf8'),
       fs.writeFile(path.join(genDir, 'schema.jsonld'), assets.schemaJsonLdTag + '\n', 'utf8'),
-    ]);
+      fs.writeFile(path.join(secDir, 'vercel.json'), assets.securitySnippets['vercel.json'] + '\n', 'utf8'),
+      fs.writeFile(path.join(secDir, 'next.config.js'), assets.securitySnippets['next.config.js'] + '\n', 'utf8'),
+      fs.writeFile(path.join(secDir, '_headers'), assets.securitySnippets['_headers'] + '\n', 'utf8'),
+      fs.writeFile(path.join(secDir, 'nginx.conf'), assets.securitySnippets['nginx.conf'] + '\n', 'utf8'),
+    ];
+    if (assets.securityBadgeHtml && assets.securityBadgeSvg) {
+      writes.push(
+        fs.writeFile(path.join(genDir, 'security-badge.html'), assets.securityBadgeHtml + '\n', 'utf8'),
+        fs.writeFile(path.join(genDir, 'security-badge.svg'), assets.securityBadgeSvg + '\n', 'utf8')
+      );
+    }
+    await Promise.all(writes);
     console.error(`[TourForge CLI] Wrote artifacts to ${outAbs}`);
   }
 
@@ -318,6 +332,8 @@ Options:
           overallScore: scorecard.overallScore,
           grade: scorecard.grade,
           isProvisional: scorecard.isProvisional,
+          securityScore: secScoreVal,
+          securityBadgeEligible: audit.security?.badgeEligible ?? false,
           aiReadinessScore: aiSummary.score,
           repoChangesCount: repoChanges.length,
           repoChanges,

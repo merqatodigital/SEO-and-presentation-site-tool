@@ -81,7 +81,13 @@ import {
   buildGeneratedRepoAssets,
   buildGitHubIssueBody,
   buildRepoChangeChecklist,
+  buildSecurityHeaderSnippets,
 } from './githubReport';
+import {
+  analyzePassiveSecurity,
+  buildSecurityBadgeSnippet,
+  buildSecurityBadgeSvg,
+} from './securityFindings';
 import { parseCliArgs } from '../../scripts/agent-audit';
 import { handleJsonRpcMessage, handleMcpToolCall } from '../../scripts/mcp-server';
 
@@ -1698,6 +1704,439 @@ test('AGENT CLI & MCP SERVER: parses CLI args and responds to JSON-RPC initializ
   assert.match(parsedFixes.files['public/llms.txt'], /Mabuhay Villas/);
   assert.match(parsedFixes.githubIssueMarkdown, /Mabuhay Villas/);
 });
+
+test('PASSIVE SECURITY: evaluates strong, missing, and weak HTTP security headers and TLS state', () => {
+  const cleanHtml = '<!doctype html><html lang="en"><head><title>Safe Resort</title></head><body><h1>Safe Resort</h1></body></html>';
+
+  const hardened = analyzePassiveSecurity({
+    finalUrl: 'https://safe-resort.example/',
+    isHttps: true,
+    html: cleanHtml,
+    tlsInfo: { protocol: 'TLSv1.3', certificateValid: true },
+    headers: {
+      'content-security-policy':
+        "default-src 'self'; script-src 'self'; frame-ancestors 'none'; object-src 'none'",
+      'strict-transport-security': 'max-age=31536000; includeSubDomains; preload',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'strict-origin-when-cross-origin',
+      'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+    },
+    setCookies: ['__Host-sid=abc123; Secure; HttpOnly; SameSite=Lax'],
+  });
+
+  assert.equal(hardened.headersChecked, true);
+  assert.equal(hardened.tls.protocol, 'TLSv1.3');
+  assert.equal(hardened.tls.hstsEnabled, true);
+  assert.equal(hardened.highSeverityCount, 0);
+  assert.equal(hardened.badgeEligible, true);
+  assert.equal(hardened.findings.every((f) => f.status === 'pass'), true);
+
+  const missingHeaders = analyzePassiveSecurity({
+    finalUrl: 'http://insecure-resort.example/',
+    isHttps: false,
+    html: cleanHtml,
+    headers: {
+      server: 'nginx/1.18.0',
+    },
+  });
+  assert.equal(missingHeaders.badgeEligible, false);
+  assert.ok(missingHeaders.highSeverityCount >= 2);
+  assert.equal(missingHeaders.findings.find((f) => f.id === 'sec-csp')?.status, 'fail');
+  assert.equal(missingHeaders.findings.find((f) => f.id === 'sec-hsts')?.status, 'fail');
+  assert.equal(missingHeaders.findings.find((f) => f.id === 'sec-xcto')?.status, 'warn');
+  assert.equal(missingHeaders.findings.find((f) => f.id === 'sec-xfo')?.status, 'warn');
+  assert.equal(missingHeaders.findings.find((f) => f.id === 'sec-referrer')?.status, 'warn');
+  assert.equal(missingHeaders.findings.find((f) => f.id === 'sec-permissions')?.status, 'warn');
+
+  const weakPolicy = analyzePassiveSecurity({
+    finalUrl: 'https://weak-policy.example/',
+    isHttps: true,
+    html: cleanHtml,
+    headers: {
+      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' *",
+      'strict-transport-security': 'max-age=3600',
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'SAMEORIGIN',
+      'referrer-policy': 'unsafe-url',
+      'permissions-policy': 'geolocation=()',
+    },
+  });
+  assert.equal(weakPolicy.findings.find((f) => f.id === 'sec-csp')?.status, 'warn');
+  assert.equal(weakPolicy.findings.find((f) => f.id === 'sec-hsts')?.status, 'warn');
+  assert.equal(weakPolicy.findings.find((f) => f.id === 'sec-xfo')?.status, 'pass');
+  assert.equal(weakPolicy.findings.find((f) => f.id === 'sec-referrer')?.status, 'warn');
+});
+
+test('PASSIVE SECURITY: classifies active vs passive mixed content and ignores XML namespaces', () => {
+  const xmlNsOnlyHtml = `<!doctype html>
+    <html>
+      <head><title>Clean SVG Page</title></head>
+      <body>
+        <svg xmlns="http://www.w3.org/2000/svg"><circle cx="5" cy="5" r="4" /></svg>
+        <div itemtype="http://schema.org/Hotel">Hotel</div>
+      </body>
+    </html>`;
+  const cleanRes = analyzePassiveSecurity({
+    finalUrl: 'https://clean-svg.example/',
+    isHttps: true,
+    html: xmlNsOnlyHtml,
+    headers: { 'x-content-type-options': 'nosniff' },
+  });
+  assert.equal(cleanRes.mixedContent.count, 0);
+  assert.equal(cleanRes.findings.find((f) => f.id === 'sec-mixed-content')?.status, 'pass');
+
+  const passiveMixed = analyzePassiveSecurity({
+    finalUrl: 'https://passive-mix.example/',
+    isHttps: true,
+    html: '<html><body><img src="http://cdn.example/photo.jpg" alt="photo" /></body></html>',
+    headers: { 'x-content-type-options': 'nosniff' },
+  });
+  assert.equal(passiveMixed.mixedContent.activeUrls.length, 0);
+  assert.equal(passiveMixed.mixedContent.passiveUrls.length, 1);
+  assert.equal(passiveMixed.findings.find((f) => f.id === 'sec-mixed-content')?.status, 'warn');
+  assert.equal(passiveMixed.findings.find((f) => f.id === 'sec-mixed-content')?.severity, 'medium');
+
+  const activeMixed = analyzePassiveSecurity({
+    finalUrl: 'https://active-mix.example/',
+    isHttps: true,
+    html: '<html><head><script src="http://cdn.example/app.js"></script></head><body><form action="http://submit.example/book"></form></body></html>',
+    headers: { 'x-content-type-options': 'nosniff' },
+  });
+  assert.equal(activeMixed.mixedContent.activeUrls.length, 2);
+  const activeFinding = activeMixed.findings.find((f) => f.id === 'sec-mixed-content');
+  assert.equal(activeFinding?.status, 'fail');
+  assert.equal(activeFinding?.severity, 'high');
+});
+
+test('PASSIVE SECURITY: audits Set-Cookie flags (Secure, HttpOnly, SameSite) and SameSite=None without Secure', () => {
+  const badCookies = analyzePassiveSecurity({
+    finalUrl: 'https://cookies.example/',
+    isHttps: true,
+    html: '<html><body><p>Hello</p></body></html>',
+    headers: { 'x-content-type-options': 'nosniff' },
+    setCookies: [
+      'session_id=xyz; Path=/',
+      'prefs=dark; Secure; HttpOnly; SameSite=None',
+      'tracker=1; HttpOnly; SameSite=None',
+    ],
+  });
+
+  assert.equal(badCookies.cookies.total, 3);
+  assert.deepEqual(badCookies.cookies.missingSecure, ['session_id', 'tracker']);
+  assert.deepEqual(badCookies.cookies.missingHttpOnly, ['session_id']);
+  assert.deepEqual(badCookies.cookies.missingSameSite, ['session_id']);
+  assert.deepEqual(badCookies.cookies.weakSameSite, ['tracker']);
+
+  const cookieFinding = badCookies.findings.find((f) => f.id === 'sec-cookies');
+  assert.equal(cookieFinding?.status, 'fail');
+  assert.equal(cookieFinding?.severity, 'high');
+
+  const warnCookie = analyzePassiveSecurity({
+    finalUrl: 'https://cookies-warn.example/',
+    isHttps: true,
+    html: '<html><body><p>Hello</p></body></html>',
+    headers: { 'x-content-type-options': 'nosniff' },
+    setCookies: ['csrf=abc; Secure; SameSite=Strict'],
+  });
+  assert.equal(warnCookie.findings.find((f) => f.id === 'sec-cookies')?.status, 'warn');
+  assert.equal(warnCookie.findings.find((f) => f.id === 'sec-cookies')?.severity, 'medium');
+});
+
+test('PASSIVE SECURITY: detects & redacts exposed secrets, exposure hints, source maps, scripts, and form issues', () => {
+  const syntheticAws = ['AKIA', 'IOSFODNN7EXAMPLE'].join('');
+  const syntheticGh = ['ghp_', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ123456'].join('');
+  const syntheticStripe = ['sk_live_', '99887766554433221100AABBCC'].join('');
+  const syntheticDb = ['postgres://', 'admin:SuperSecretPass99', '@db.internal:5432/prod'].join('');
+  const syntheticPem = ['-----BEGIN RSA ', 'PRIVATE KEY-----'].join('');
+
+  const leakyHtml = `<!doctype html>
+  <html>
+    <head>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/1.12.4/jquery.min.js"></script>
+      <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" integrity="sha384-abc123" crossorigin="anonymous"></script>
+      <link rel="stylesheet" href="/assets/app.css.map" />
+    </head>
+    <body>
+      <a href="/.git/config">Repo Config</a>
+      <a href="/.env.production">Env File</a>
+      <form method="post" action="/login">
+        <input type="password" name="user_password" />
+        <button type="submit">Sign In</button>
+      </form>
+      <script>
+        const aws = "${syntheticAws}";
+        const gh = "${syntheticGh}";
+        const stripe = "${syntheticStripe}";
+        const db = "${syntheticDb}";
+        const pem = "${syntheticPem}";
+        //# sourceMappingURL=bundle.js.map
+      </script>
+    </body>
+  </html>`;
+
+  const res = analyzePassiveSecurity({
+    finalUrl: 'https://leaky.example/',
+    isHttps: true,
+    html: leakyHtml,
+    robotsTxtContent: 'User-agent: *\nDisallow: /.env\nDisallow: /backup.sql\n',
+    headers: {
+      'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
+      'strict-transport-security': 'max-age=31536000; includeSubDomains',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'strict-origin-when-cross-origin',
+      'permissions-policy': 'camera=()',
+      'x-powered-by': 'Express 4.18',
+    },
+  });
+
+  // Secrets must be detected AND redacted so raw secrets are never returned
+  assert.equal(res.secrets.count, 5);
+  const secretsFinding = res.findings.find((f) => f.id === 'sec-secrets');
+  assert.equal(secretsFinding?.status, 'fail');
+  assert.equal(secretsFinding?.severity, 'high');
+  assert.equal(secretsFinding?.evidence.includes(syntheticGh), false);
+  assert.equal(secretsFinding?.evidence.includes(syntheticStripe), false);
+  assert.equal(secretsFinding?.evidence.includes('SuperSecretPass99'), false);
+  assert.equal(res.badgeEligible, false);
+
+  // Exposure hints (.git/config, .env, robots.txt hint, X-Powered-By)
+  assert.ok(res.exposureHints.count >= 4);
+  assert.equal(res.findings.find((f) => f.id === 'sec-exposure-hints')?.status, 'fail');
+
+  // Source maps
+  assert.equal(res.sourceMaps.count, 2);
+  assert.equal(res.findings.find((f) => f.id === 'sec-source-maps')?.status, 'warn');
+
+  // Third-party script inventory & legacy detection
+  assert.equal(res.thirdPartyScripts.length, 2);
+  const jq = res.thirdPartyScripts.find((s) => s.library === 'jquery');
+  assert.equal(jq?.version, '1.12.4');
+  assert.equal(jq?.hasSri, false);
+  const alpine = res.thirdPartyScripts.find((s) => s.library === 'alpinejs');
+  assert.equal(alpine?.version, '3.14.1');
+  assert.equal(alpine?.hasSri, true);
+  assert.equal(res.findings.find((f) => f.id === 'sec-third-party-scripts')?.status, 'warn');
+
+  // Form autocomplete & POST CSRF hint
+  assert.equal(res.forms.totalForms, 1);
+  assert.equal(res.forms.postFormsWithoutCsrfHint, 1);
+  assert.equal(res.forms.sensitiveInputsWithoutAutocompleteOff, 1);
+  assert.equal(res.findings.find((f) => f.id === 'sec-forms')?.status, 'warn');
+});
+
+test('PASSIVE SECURITY: blocked site marks sec-* checks unknown, and badge helpers escape HTML safely', () => {
+  const blocked = analyzePassiveSecurity({
+    finalUrl: 'https://waf.example/',
+    isHttps: true,
+    html: '<html><title>Just a moment...</title></html>',
+    headers: { 'x-content-type-options': 'nosniff' },
+    contentBlocked: true,
+  });
+
+  assert.equal(blocked.badgeEligible, false);
+  assert.equal(blocked.findings.every((f) => f.status === 'unknown'), true);
+  assert.equal(blocked.findings[0]?.evidence, 'This site blocks automated checks');
+
+  const svg = buildSecurityBadgeSvg('Coral <Resort> & "Spa"', 95);
+  assert.match(svg, /Security Passed/);
+  assert.match(svg, /95\/100/);
+  assert.equal(svg.includes('<Resort>'), false);
+
+  const snippet = buildSecurityBadgeSnippet('Coral Resort', 'https://coral.example/?a=1&b=2', 95);
+  assert.match(snippet, /^<a href="https:\/\/coral\.example\/\?a=1&amp;b=2"/);
+  assert.match(snippet, /<svg /);
+});
+
+test('PASSIVE SECURITY SCORECARD: computes SecurityScore weight (10%), <50% insufficient-data exclusion, and <70% provisional rule', () => {
+  const cleanHtml = `<!doctype html><html lang="en"><head><title>Secure Villa</title></head><body><h1>Villa</h1><form method="post"><input type="hidden" name="csrf_token" value="1" /><input type="password" name="pw" autocomplete="current-password" /></form></body></html>`;
+  const secAudit = analyzePassiveSecurity({
+    finalUrl: 'https://secure-villa.example/',
+    isHttps: true,
+    html: cleanHtml,
+    headers: {
+      'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
+      'strict-transport-security': 'max-age=31536000; includeSubDomains',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'strict-origin-when-cross-origin',
+      'permissions-policy': 'camera=()',
+    },
+  });
+
+  const audit = makeMinimalAudit([
+    {
+      id: 'seo-https',
+      category: 'seo',
+      label: 'HTTPS',
+      status: 'pass',
+      evidence: 'HTTPS active',
+      fix: 'None',
+      businessImpact: 'Security',
+      weight: 5,
+    },
+    ...secAudit.findings,
+  ]);
+  audit.security = secAudit;
+
+  const parsed = AuditResultSchema.safeParse(audit);
+  assert.equal(parsed.success, true);
+
+  const card = computeScorecard(audit, createEmptyManualFootprint(), createDefaultAssumptions());
+  assert.equal(card.securityScore?.id, 'security');
+  assert.equal(card.securityScore?.baseWeight, 10);
+  assert.equal(card.securityScore?.score, 100);
+  assert.equal(card.securityScore?.insufficientData, false);
+  assert.equal(card.overallScore, 100);
+  // GBP/Social still missing -> completeness < 70 -> Provisional stays true
+  assert.equal(card.isProvisional, true);
+
+  // If >= 50% of security findings are unknown, securityScore must be excluded as insufficientData
+  const mostlyUnknownSec = analyzePassiveSecurity({
+    finalUrl: 'https://unknown-sec.example/',
+    isHttps: true,
+    html: cleanHtml,
+    headers: {},
+    headersChecked: false, // 7/12 unknown (>50%)
+  });
+  const auditInsufficient = makeMinimalAudit([
+    {
+      id: 'seo-https',
+      category: 'seo',
+      label: 'HTTPS',
+      status: 'pass',
+      evidence: 'HTTPS active',
+      fix: 'None',
+      businessImpact: 'Security',
+      weight: 5,
+    },
+    ...mostlyUnknownSec.findings,
+  ]);
+  const cardInsufficient = computeScorecard(
+    auditInsufficient,
+    createEmptyManualFootprint(),
+    createDefaultAssumptions()
+  );
+  assert.equal(cardInsufficient.securityScore?.insufficientData, true);
+  assert.equal(cardInsufficient.securityScore?.score, null);
+  assert.equal(cardInsufficient.securityScore?.effectiveWeight, 0);
+});
+
+test('PASSIVE SECURITY GITHUB & MCP: maps high-severity findings to vercel/next/netlify/nginx snippets and audit pipeline', async () => {
+  const secAudit = analyzePassiveSecurity({
+    finalUrl: 'https://header-gap.example/',
+    isHttps: true,
+    html: '<!doctype html><html lang="en"><head><title>Header Gap Resort</title></head><body><h1>Resort</h1><a href="tel:+639171234567">Call</a><p>Direct bookings open daily with local concierge support and private boat pickup in Palawan.</p></body></html>',
+    headers: {
+      server: 'nginx/1.22.0',
+    },
+  });
+
+  const audit = makeMinimalAudit([...secAudit.findings]);
+  audit.security = secAudit;
+  const scorecard = computeScorecard(audit, createEmptyManualFootprint(), createDefaultAssumptions());
+  const aiSummary = buildAiReadinessSummary(audit);
+  const actions = buildRepoChangeChecklist(audit, aiSummary);
+
+  const cspAction = actions.find((a) => a.findingId === 'sec-csp');
+  assert.equal(cspAction?.priority, 'P0');
+  assert.equal(cspAction?.severity, 'high');
+  assert.ok(cspAction?.targetRepoPaths.includes('vercel.json'));
+  assert.ok(cspAction?.targetRepoPaths.includes('next.config.js'));
+  assert.ok(cspAction?.snippets?.['vercel.json']);
+  assert.ok(cspAction?.snippets?.['next.config.js']);
+  assert.ok(cspAction?.snippets?.['_headers']);
+  assert.ok(cspAction?.snippets?.['nginx.conf']);
+
+  const snippets = buildSecurityHeaderSnippets(audit);
+  assert.match(snippets['vercel.json'], /Content-Security-Policy/);
+  assert.match(snippets['next.config.js'], /Strict-Transport-Security/);
+  assert.match(snippets['_headers'], /X-Content-Type-Options: nosniff/);
+  assert.match(snippets['nginx.conf'], /add_header Strict-Transport-Security/);
+
+  const reportMd = buildAgentMarkdownReport({
+    url: 'https://header-gap.example/',
+    project: {
+      clientName: 'Header Gap Resort',
+      businessType: 'Resort',
+      brief: 'Direct bookings',
+      brandColor: '#0F766E',
+      logoDataUrl: null,
+    },
+    audit,
+    scorecard,
+    aiSummary,
+    repoChanges: actions,
+  });
+  assert.match(reportMd, /## Passive Security & Headers Audit/);
+  assert.match(reportMd, /Content-Security-Policy/);
+
+  // executeFullSiteAudit integration populates audit.security passively
+  const fullAudit = await executeFullSiteAudit('https://clean-pass.example/', {
+    deps: {
+      validateUrl: async (u) => new URL(u),
+      fetchHtml: async (u) => {
+        if (u.endsWith('/robots.txt')) {
+          return {
+            finalUrl: u,
+            statusCode: 200,
+            ttfbMs: 12,
+            bytes: 24,
+            text: 'User-agent: *\nAllow: /',
+            contentType: 'text/plain',
+          };
+        }
+        if (u.endsWith('/sitemap.xml') || u.endsWith('/llms.txt')) {
+          return {
+            finalUrl: u,
+            statusCode: 200,
+            ttfbMs: 12,
+            bytes: 20,
+            text: '<urlset></urlset>',
+            contentType: 'application/xml',
+          };
+        }
+        return {
+          finalUrl: 'https://clean-pass.example/',
+          statusCode: 200,
+          ttfbMs: 110,
+          bytes: 400,
+          text: '<!doctype html><html lang="en"><head><title>Clean Pass Resort</title></head><body><h1>Welcome</h1><p>Direct beachfront hospitality in Palawan with daily breakfast and airport transfers included for all stays.</p></body></html>',
+          contentType: 'text/html',
+          headers: {
+            'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
+            'strict-transport-security': 'max-age=31536000; includeSubDomains',
+            'x-content-type-options': 'nosniff',
+            'referrer-policy': 'strict-origin-when-cross-origin',
+            'permissions-policy': 'camera=()',
+          },
+          setCookies: [],
+        };
+      },
+      runSpeed: async () => ({ speed: null, reason: 'Skipped in unit test' }),
+      probeTls: async () => ({ protocol: 'TLSv1.3', certificateValid: true, validTo: null }),
+    },
+  });
+
+  assert.ok(fullAudit.security);
+  assert.equal(fullAudit.security?.badgeEligible, true);
+  assert.equal(fullAudit.security?.tls.protocol, 'TLSv1.3');
+  assert.equal(fullAudit.findings.some((f) => f.id === 'sec-csp' && f.status === 'pass'), true);
+
+  // MCP tool tourforge_generate_repo_fixes surfaces security snippets & badge when eligible
+  const mcpFixes = await handleMcpToolCall('tourforge_generate_repo_fixes', {
+    url: 'https://clean-pass.example/',
+    clientName: 'Clean Pass Resort',
+    auditResult: fullAudit,
+  });
+  const mcpData = JSON.parse(mcpFixes.content[0].text) as {
+    files: Record<string, string>;
+  };
+  assert.match(mcpData.files['vercel.json'], /Content-Security-Policy/);
+  assert.match(mcpData.files['next.config.js'], /Strict-Transport-Security/);
+  assert.match(mcpData.files['_headers'], /X-Content-Type-Options: nosniff/);
+  assert.match(mcpData.files['nginx.conf'], /add_header Strict-Transport-Security/);
+  assert.match(mcpData.files['security-badge.html'], /Security Passed/);
+});
+
 
 
 

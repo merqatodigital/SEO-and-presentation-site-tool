@@ -1,4 +1,5 @@
 import { buildAutomatedFindings } from './htmlFindings';
+import { analyzePassiveSecurity } from './securityFindings';
 import { AuditAssumptions, AuditResult, ManualFootprint, createEmptyManualFootprint } from './types';
 
 export function buildSampleAudit(): {
@@ -83,7 +84,7 @@ export function buildSampleAudit(): {
     ],
   };
 
-  const findings = buildAutomatedFindings({
+  const baseFindings = buildAutomatedFindings({
     isHttps: true,
     fetchError: null,
     ttfbMs: 420,
@@ -94,6 +95,24 @@ export function buildSampleAudit(): {
     speed,
     speedReason: null,
   });
+
+  const security = analyzePassiveSecurity({
+    finalUrl: 'https://harborcrest-dental.example/',
+    isHttps: true,
+    html: '<html><head><title>Harborcrest Dental Studio</title></head><body><form method="post" action="/book"><input type="text" name="patientName" /></form></body></html>',
+    headers: {
+      'strict-transport-security': 'max-age=31536000; includeSubDomains',
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'SAMEORIGIN',
+      'referrer-policy': 'strict-origin-when-cross-origin',
+      'permissions-policy': 'camera=(), microphone=()',
+    },
+    setCookies: [],
+    tlsInfo: { protocol: 'TLSv1.3', certificateValid: true, validTo: '2027-06-01' },
+    headersChecked: true,
+  });
+
+  const findings = [...baseFindings, ...security.findings];
 
   const audit: AuditResult = {
     schemaVersion: '1.0',
@@ -141,6 +160,7 @@ export function buildSampleAudit(): {
         hasGeo: false,
       },
     },
+    security,
     parsed,
     robotsTxt,
     sitemapXml,

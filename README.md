@@ -1,9 +1,11 @@
 # TourForge Lite
 
+> **Release v0.1.0:** Added the 100% passive security & headers audit layer, 10%-weighted `Passive Security & Headers` scorecard category, ready-to-commit server header snippets, and embeddable "Security Passed" badge.
+
 TourForge Lite turns a client website URL or uploaded screenshots and a short brief into an **evidence-based visibility audit, one-page RAG scorecard, outcome-first walkthrough player, and editable 2027 digital proposal**.
 
-- **Deterministic Audit Engine**: All HTML, SEO, contact/CTA, NAP consistency, median TTFB, and Lighthouse mobile speed checks run deterministically in TypeScript (`src/audit/*`, Cheerio, and open-source Lighthouse).
-- **BYOK AI Generation**: Walkthrough narration and highlight coordinates use a single OpenAI-compatible client (`POST {baseUrl}/chat/completions`) configured via browser `localStorage` (OpenRouter, NVIDIA NIM, or any custom endpoint).
+- **Deterministic Audit Engine**: All HTML, SEO, contact/CTA, passive security/header, NAP consistency, median TTFB, and Lighthouse mobile speed checks run deterministically in TypeScript (`src/audit/*`, Cheerio, and open-source Lighthouse).
+- **BYOK AI Generation**: Walkthrough narration and highlight coordinates use a single OpenAI-compatible client (`POST {baseUrl}/chat/completions`) configured via browser `localStorage` (OpenRouter, NVIDIA NIM, local Ollama, or any custom endpoint).
 
 ---
 
@@ -113,6 +115,22 @@ Runs SSRF-protected HTML parsing (Cheerio), 3-request median TTFB timing, `/robo
     "opportunities": []
   },
   "speedReason": null,
+  "security": {
+    "checkedAt": "2026-11-23T00:00:00.000Z",
+    "headersChecked": true,
+    "tls": { "isHttps": true, "protocol": "TLSv1.3", "certificateValid": true, "hstsEnabled": false, "hstsMaxAge": null },
+    "headerChecks": [],
+    "mixedContent": { "activeUrls": [], "passiveUrls": [], "count": 0 },
+    "cookies": { "total": 0, "missingSecure": [], "missingHttpOnly": [], "missingSameSite": [], "weakSameSite": [] },
+    "secrets": { "count": 0, "findings": [] },
+    "exposureHints": { "count": 0, "hints": [] },
+    "sourceMaps": { "count": 0, "urls": [] },
+    "thirdPartyScripts": [],
+    "forms": { "totalForms": 0, "postFormsWithoutCsrfHint": 0, "sensitiveInputsWithoutAutocompleteOff": 0 },
+    "findings": [],
+    "highSeverityCount": 2,
+    "badgeEligible": false
+  },
   "findings": []
 }
 ```
@@ -170,6 +188,34 @@ Proxies the upstream JSON status and body directly:
 
 ---
 
+## Passive security audit
+
+**All checks in this layer are strictly passive.** TourForge Lite inspects only the public HTML, response headers, `robots.txt`, and single-endpoint TLS metadata already retrieved by `/api/audit`. It never performs port scanning, directory brute-forcing, vulnerability exploitation, or authentication bypasses.
+
+### What is checked
+- **Security Headers**: Evaluates `Content-Security-Policy` (flags missing CSP or weak directives like `'unsafe-eval'`, `'unsafe-inline'` without nonce/hash, wildcard `*`, or `http:`), `Strict-Transport-Security` (missing, HTTP-only, short `max-age`, or missing `includeSubDomains`), `X-Content-Type-Options` (`nosniff`), `X-Frame-Options` (`DENY` / `SAMEORIGIN`, or satisfied via CSP `frame-ancestors`), `Referrer-Policy`, and `Permissions-Policy`.
+- **TLS State**: Records HTTPS active state, negotiated TLS protocol (`TLSv1.3`, etc.), certificate validity/expiration, and active HSTS status/`max-age`.
+- **Active vs. Passive Mixed Content**: On HTTPS pages, flags `http://` scripts, stylesheets, iframes, objects/embeds, and form actions as high-severity active mixed content (`fail`), and `http://` media (`img`, `video`, `audio`, `source`) as medium-severity passive mixed content (`warn`), while ignoring benign XML namespace URIs (`http://www.w3.org/...`, `http://schema.org`).
+- **Cookie Flags**: Inspects `Set-Cookie` headers for missing `Secure`, `HttpOnly`, and `SameSite` attributes, plus `SameSite=None` without `Secure`.
+- **Secret Redaction**: Scans HTML and inline scripts for exposed credential patterns (private key blocks, AWS `AKIA` keys, GitHub tokens, Stripe secret/restricted keys, Slack tokens, OpenRouter/OpenAI keys, and DB URIs with embedded passwords) and always redacts matched values (`prefix…***`) before storing evidence.
+- **`.git` / `.env` / Backup Exposure Hints**: Passively scans fetched HTML, `robots.txt`, and `Server` / `X-Powered-By` headers for directory listings (`Index of /`), links/references to `.git/*`, `.env*`, `*.bak`, or SQL dumps, and verbose server version banners.
+- **Source Maps**: Detects public `sourceMappingURL=` comments and `.map` script/stylesheet references shipped to production.
+- **Third-Party Scripts & SRI**: Builds an inventory of external `<script src>` dependencies, extracts library names and versions where detectable, flags legacy versions (e.g., jQuery `< 3.5`, Bootstrap `< 4`, AngularJS `1.x`), and checks Subresource Integrity (`integrity="..."`).
+- **Form Autocomplete & CSRF Hints**: Flags password or sensitive payment/secret inputs lacking explicit safe `autocomplete` attributes (`off`, `new-password`, `current-password`, `one-time-code`) and `POST` forms without a visible anti-CSRF hidden token field.
+
+### Scorecard Weighting & Rules
+- `Passive Security & Headers` (`security`) contributes **10%** of the weighted overall scorecard (`gbp` 25%, `seo` 20%, `contact` 20%, `speed` 15%, `social` 10%, `security` 10%).
+- Reuses TourForge Lite's global data-completeness rules: if `<50%` of security checks are measurable (e.g., headers unavailable or site behind a bot challenge), `securityScore` is marked **Insufficient data** and excluded via weight renormalization; overall score remains **Provisional** whenever total measured completeness is `<70%`.
+
+### Audit JSON & CLI `report.md` Fields
+- **Audit JSON (`/api/audit` & exported bundles)**: Adds `audit.security` (`PassiveSecurityAudit`), `category: "security"` findings with optional `severity` (`high | medium | low | info`) in `audit.findings`, and `scorecard.securityScore` (`CategoryScore`).
+- **CLI `report.md` (`npm run audit:cli`)**: Appends a **`## Passive Security & Headers Audit`** summary and header status table, maps failing/warning security checks into **`## Required Changes in GitHub Repository`**, and writes ready-to-commit snippets into `generated/security-headers/{vercel.json,next.config.js,_headers,nginx.conf}` (plus `generated/security-badge.{html,svg}` when eligible).
+
+### Embeddable `"Security Passed"` Badge
+When `headersChecked === true` and `highSeverityCount === 0` (`audit.security.badgeEligible === true`), the **Scorecard** tab displays a live `"Security Passed"` SVG badge inside the **Passive Security & Headers** panel. Click **Copy embed HTML** to copy a self-contained `<a><svg>…</svg></a>` snippet the site owner can paste directly into their site footer or trust page.
+
+---
+
 ## Container hardening
 
 1. **Generate a strong bearer token** (`NODE_ENV=production` refuses to start if `CAPTURE_TOKEN` is shorter than 32 characters):
@@ -199,10 +245,12 @@ Proxies the upstream JSON status and body directly:
 
 The entire audit, scoring, NAP matching, and JSON-LD generation layer in `src/audit/*` is **pure, portable TypeScript** with **zero DOM/browser, React, or AI SDK dependencies**:
 
-- `src/audit/types.ts` — Canonical Zod schemas and TypeScript contracts (`AuditResult`, `AuditFinding`, `ManualFootprint`, `AuditAssumptions`, `Scorecard`, `ProspectEntry`).
+- `src/audit/types.ts` — Canonical Zod schemas and TypeScript contracts (`AuditResult`, `AuditFinding`, `SecurityFinding`, `PassiveSecurityAudit`, `ManualFootprint`, `AuditAssumptions`, `Scorecard`, `ProspectEntry`).
 - `src/audit/htmlFindings.ts` — Pure Cheerio HTML extraction, CTA matching, client name derivation, and deterministic automated check evaluation.
+- `src/audit/securityFindings.ts` — Pure passive security header, TLS, mixed-content, cookie, redacted-secret, exposure-hint, source-map, third-party script, form/CSRF, and `"Security Passed"` badge evaluator.
 - `src/audit/nap.ts` — Pure business name, phone, and address token normalization plus directory consistency findings.
-- `src/audit/scorecard.ts` — Deterministic weighted category scoring, `<50%` insufficient-data exclusion, `<70%` provisional flag, Fix First sorting, ignored-leads range math, and outreach summary generator.
+- `src/audit/scorecard.ts` — Deterministic weighted category scoring (`securityScore` at 10%), `<50%` insufficient-data exclusion, `<70%` provisional flag, Fix First sorting, ignored-leads range math, and outreach summary generator.
+- `src/audit/githubReport.ts` — Repo file change mapping, `vercel.json` / `next.config.js` / `_headers` / `nginx.conf` security header snippets, Markdown reports, and bundle export builders.
 - `src/audit/jsonLd.ts` — Schema JSON-LD builder and `JSON.parse` validator.
 - `src/audit/bundleMigration.ts` — Backward-compatible `v1`/`v2` project JSON import migration.
 

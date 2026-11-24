@@ -9,7 +9,14 @@ import { z } from 'zod';
 export const FindingStatusSchema = z.enum(['pass', 'warn', 'fail', 'unknown']);
 export type FindingStatus = z.infer<typeof FindingStatusSchema>;
 
-export const AuditCategoryIdSchema = z.enum(['gbp', 'seo', 'contact', 'speed', 'social']);
+export const AuditCategoryIdSchema = z.enum([
+  'gbp',
+  'seo',
+  'contact',
+  'speed',
+  'social',
+  'security',
+]);
 export type AuditCategoryId = z.infer<typeof AuditCategoryIdSchema>;
 
 export interface CategoryDefinition {
@@ -19,12 +26,16 @@ export interface CategoryDefinition {
 }
 
 export const AUDIT_CATEGORIES: CategoryDefinition[] = [
-  { id: 'gbp', label: 'Business Profile (GBP) & Reviews', weight: 30 },
+  { id: 'gbp', label: 'Business Profile (GBP) & Reviews', weight: 25 },
   { id: 'seo', label: 'On-page SEO & Structured Data', weight: 20 },
   { id: 'contact', label: 'Contact & Conversion', weight: 20 },
   { id: 'speed', label: 'Speed & Mobile', weight: 15 },
-  { id: 'social', label: 'Social & Listings Consistency', weight: 15 },
+  { id: 'social', label: 'Social & Listings Consistency', weight: 10 },
+  { id: 'security', label: 'Passive Security & Headers', weight: 10 },
 ];
+
+export const SecuritySeveritySchema = z.enum(['high', 'medium', 'low', 'info']);
+export type SecuritySeverity = z.infer<typeof SecuritySeveritySchema>;
 
 export const AuditFindingSchema = z.object({
   id: z.string().min(1),
@@ -35,8 +46,15 @@ export const AuditFindingSchema = z.object({
   fix: z.string(),
   businessImpact: z.string(),
   weight: z.number().min(1).max(5),
+  severity: SecuritySeveritySchema.optional(),
 });
 export type AuditFinding = z.infer<typeof AuditFindingSchema>;
+
+export const SecurityFindingSchema = AuditFindingSchema.extend({
+  category: z.literal('security'),
+  severity: SecuritySeveritySchema,
+});
+export type SecurityFinding = z.infer<typeof SecurityFindingSchema>;
 
 export const SpeedOpportunitySchema = z.object({
   id: z.string(),
@@ -158,6 +176,77 @@ export type AuditNote = z.infer<typeof AuditNoteSchema>;
 export const ContentSourceSchema = z.enum(['raw', 'rendered', 'blocked']);
 export type ContentSource = z.infer<typeof ContentSourceSchema>;
 
+export const PassiveSecurityHeaderCheckSchema = z.object({
+  header: z.string(),
+  present: z.boolean(),
+  status: FindingStatusSchema,
+  valuePreview: z.string().nullable(),
+  detail: z.string(),
+});
+export type PassiveSecurityHeaderCheck = z.infer<typeof PassiveSecurityHeaderCheckSchema>;
+
+export const ThirdPartyScriptItemSchema = z.object({
+  src: z.string(),
+  host: z.string(),
+  library: z.string().nullable(),
+  version: z.string().nullable(),
+  hasSri: z.boolean(),
+});
+export type ThirdPartyScriptItem = z.infer<typeof ThirdPartyScriptItemSchema>;
+
+export const PassiveSecurityAuditSchema = z.object({
+  checkedAt: z.string(),
+  headersChecked: z.boolean(),
+  tls: z.object({
+    isHttps: z.boolean().nullable(),
+    protocol: z.string().nullable().optional(),
+    certificateValid: z.boolean().nullable().optional(),
+    validTo: z.string().nullable().optional(),
+    hstsEnabled: z.boolean(),
+    hstsMaxAge: z.number().nullable(),
+  }),
+  headerChecks: z.array(PassiveSecurityHeaderCheckSchema),
+  mixedContent: z.object({
+    activeUrls: z.array(z.string()),
+    passiveUrls: z.array(z.string()),
+    count: z.number(),
+  }),
+  cookies: z.object({
+    total: z.number(),
+    missingSecure: z.array(z.string()),
+    missingHttpOnly: z.array(z.string()),
+    missingSameSite: z.array(z.string()),
+    weakSameSite: z.array(z.string()),
+  }),
+  secrets: z.object({
+    count: z.number(),
+    findings: z.array(
+      z.object({
+        type: z.string(),
+        previewRedacted: z.string(),
+      })
+    ),
+  }),
+  exposureHints: z.object({
+    count: z.number(),
+    hints: z.array(z.string()),
+  }),
+  sourceMaps: z.object({
+    count: z.number(),
+    urls: z.array(z.string()),
+  }),
+  thirdPartyScripts: z.array(ThirdPartyScriptItemSchema),
+  forms: z.object({
+    totalForms: z.number(),
+    postFormsWithoutCsrfHint: z.number(),
+    sensitiveInputsWithoutAutocompleteOff: z.number(),
+  }),
+  findings: z.array(SecurityFindingSchema),
+  highSeverityCount: z.number(),
+  badgeEligible: z.boolean(),
+});
+export type PassiveSecurityAudit = z.infer<typeof PassiveSecurityAuditSchema>;
+
 export const AuditResultSchema = z.object({
   schemaVersion: z.string().default('1.0'),
   requestedUrl: z.string(),
@@ -173,6 +262,7 @@ export const AuditResultSchema = z.object({
   auditNotes: z.array(AuditNoteSchema).optional(),
   redirectedFromHost: z.string().optional(),
   aiReadiness: AiReadinessSchema.optional(),
+  security: PassiveSecurityAuditSchema.optional(),
   parsed: ParsedHtmlFactsSchema.nullable(),
   robotsTxt: z.object({
     exists: z.boolean().nullable(),
@@ -394,6 +484,8 @@ export const IgnoredLeadsEstimateSchema = z.object({
 });
 export type IgnoredLeadsEstimate = z.infer<typeof IgnoredLeadsEstimateSchema>;
 
+export type SecurityScore = CategoryScore;
+
 export const ScorecardSchema = z.object({
   overallScore: z.number().nullable(),
   grade: z.enum(['A', 'B', 'C', 'D', 'F', 'N/A']),
@@ -403,6 +495,7 @@ export const ScorecardSchema = z.object({
   knownChecks: z.number(),
   totalChecks: z.number(),
   categories: z.array(CategoryScoreSchema),
+  securityScore: CategoryScoreSchema.nullable().optional(),
   fixFirst: z.array(AuditFindingSchema),
   allFindings: z.array(AuditFindingSchema),
   ignoredLeads: IgnoredLeadsEstimateSchema,

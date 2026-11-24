@@ -243,6 +243,7 @@ export function computeScorecard(
 
   const ignoredLeads = computeIgnoredLeadsEstimate(allFindings, manual, assumptions);
   const isProvisional = dataCompletenessPct < 70;
+  const securityScore = categories.find((c) => c.id === 'security') ?? null;
 
   return {
     overallScore,
@@ -253,6 +254,7 @@ export function computeScorecard(
     knownChecks,
     totalChecks,
     categories,
+    securityScore,
     fixFirst,
     allFindings,
     ignoredLeads,

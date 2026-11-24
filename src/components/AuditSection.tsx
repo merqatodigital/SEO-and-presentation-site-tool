@@ -23,7 +23,6 @@ import {
   AuditResult,
   FindingStatus,
   ManualFootprint,
-  ProspectEntry,
   RagBand,
   Scorecard,
 } from '../audit/types';
@@ -33,10 +32,10 @@ import {
   ProjectBrief,
   getContrastTextColor,
 } from '../types/tour';
+import { GbpBenchmarkPanel } from './GbpBenchmarkPanel';
 import { ManualFootprintForm } from './ManualFootprintForm';
-import { ProspectsPanel } from './ProspectsPanel';
 
-export type AuditTabId = 'auto' | 'manual' | 'scorecard' | 'prospects';
+export type AuditTabId = 'scorecard' | 'auto' | 'manual' | 'gbp-benchmark';
 
 interface AuditSectionProps {
   activeTab: AuditTabId;
@@ -51,17 +50,11 @@ interface AuditSectionProps {
   assumptions: AuditAssumptions;
   scorecard: Scorecard;
   project: ProjectBrief;
-  prospects: ProspectEntry[];
-  captureUrl: string;
-  captureToken: string;
   onRunAudit: (url: string) => void;
   onLoadSampleAudit: () => void;
   onManualFootprintChange: (next: ManualFootprint) => void;
   onAssumptionsChange: (next: AuditAssumptions) => void;
   onCurrencyChange?: (currency: CurrencyCode) => void;
-  onProspectsChange: (next: ProspectEntry[]) => void;
-  onOpenProspectScorecard: (prospect: ProspectEntry) => void;
-  onPromoteProspect: (prospect: ProspectEntry) => void;
   onPrintScorecard: () => void;
   onExportAuditJson: () => void;
 }
@@ -133,17 +126,11 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
   assumptions,
   scorecard,
   project,
-  prospects,
-  captureUrl,
-  captureToken,
   onRunAudit,
   onLoadSampleAudit,
   onManualFootprintChange,
   onAssumptionsChange,
   onCurrencyChange,
-  onProspectsChange,
-  onOpenProspectScorecard,
-  onPromoteProspect,
   onPrintScorecard,
   onExportAuditJson,
 }) => {
@@ -157,10 +144,10 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
 
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tabs: Array<{ id: AuditTabId; label: string }> = [
-    { id: 'auto', label: 'Auto audit' },
-    { id: 'manual', label: 'Manual footprint' },
     { id: 'scorecard', label: 'Scorecard' },
-    { id: 'prospects', label: `Prospects (${prospects.length})` },
+    { id: 'auto', label: 'Auto Checks' },
+    { id: 'manual', label: 'GBP & Directories' },
+    { id: 'gbp-benchmark', label: 'Competitors & Playbook' },
   ];
 
   const handleTabKeyDown = (e: React.KeyboardEvent, idx: number) => {
@@ -249,21 +236,20 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
 
   return (
     <section
-      id="audit"
-      className="no-print scroll-mt-20 space-y-6 border-t border-slate-200 pt-10 dark:border-slate-800"
+      id="step-2"
+      className="no-print scroll-mt-20 space-y-6"
     >
       {/* Section Header + Sub-Tab Navigation */}
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <p className="text-xs font-medium tracking-wide text-slate-500 dark:text-slate-400">
-            Evidence &amp; Lead Magnet Engine
+            Step 2 · Evidence Scorecard &amp; GBP Audit
           </p>
           <h2 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100 [text-wrap:balance]">
-            Website Audit &amp; Visibility Scorecard
+            Website Scorecard, GBP Profile &amp; Competitor Playbook
           </h2>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            Deterministic measured checks (HTML, Lighthouse speed, GBP &amp; NAP consistency) ground
-            every walkthrough and proposal claim.
+            Review the one-page RAG scorecard, enter Google Business Profile details, and benchmark against local competitors.
           </p>
         </div>
 
@@ -1185,15 +1171,14 @@ export const AuditSection: React.FC<AuditSectionProps> = ({
           </div>
         )}
 
-        {/* TAB 4: PROSPECTS */}
-        {activeTab === 'prospects' && (
-          <ProspectsPanel
-            prospects={prospects}
-            captureUrl={captureUrl}
-            captureToken={captureToken}
-            onProspectsChange={onProspectsChange}
-            onOpenScorecard={onOpenProspectScorecard}
-            onPromoteToProject={onPromoteProspect}
+        {/* TAB 4: GBP COMPETITORS & PLAYBOOK */}
+        {activeTab === 'gbp-benchmark' && (
+          <GbpBenchmarkPanel
+            manual={manualFootprint}
+            project={project}
+            clientName={resolvedClientName}
+            onManualChange={onManualFootprintChange}
+            onSwitchToGbpForm={() => onTabChange('manual')}
           />
         )}
       </div>

@@ -113,6 +113,34 @@ export function buildSampleAudit(): {
         message: 'Sample audit data is loaded offline; run a live audit on any public URL to test a real site.',
       },
     ],
+    aiReadiness: {
+      robotsChecked: true,
+      botAccess: [
+        { bot: 'GPTBot', label: 'OpenAI GPTBot (Search & Training)', status: 'allowed' },
+        { bot: 'ChatGPT-User', label: 'ChatGPT Live Browsing', status: 'allowed' },
+        { bot: 'OAI-SearchBot', label: 'OpenAI Search Index', status: 'allowed' },
+        { bot: 'ClaudeBot', label: 'Anthropic ClaudeBot', status: 'blocked' },
+        { bot: 'anthropic-ai', label: 'Anthropic AI Crawler', status: 'allowed' },
+        { bot: 'PerplexityBot', label: 'Perplexity Search Crawler', status: 'allowed' },
+      ],
+      llmsTxt: {
+        exists: false,
+        url: 'https://harborcrest-dental.example/llms.txt',
+        bytes: null,
+        preview: null,
+        reason: 'No /llms.txt found (HTTP 404)',
+      },
+      entityCompleteness: {
+        hasBusinessType: false,
+        hasAddress: false,
+        hasTelephone: false,
+        hasOpeningHours: false,
+        hasPriceRange: false,
+        hasSameAs: false,
+        hasFaqPage: false,
+        hasGeo: false,
+      },
+    },
     parsed,
     robotsTxt,
     sitemapXml,
@@ -167,6 +195,26 @@ export function buildSampleAudit(): {
     seenAddress: '142 Harbor Blvd',
     seenPhone: '09175559999',
   };
+  manual.competitors = [
+    {
+      id: 'comp-1',
+      name: 'North Harbor Dental Group',
+      category: 'Dentist',
+      reviewCount: 112,
+      averageRating: 4.7,
+      photoCount: 46,
+      postsLast90Days: 6,
+    },
+    {
+      id: 'comp-2',
+      name: 'Bayside Smile Clinic',
+      category: 'Cosmetic Dentist',
+      reviewCount: 64,
+      averageRating: 4.5,
+      photoCount: 28,
+      postsLast90Days: 3,
+    },
+  ];
   manual.openingHoursText = 'Mon-Sat 09:00-19:00';
   manual.priceRange = '$$';
 

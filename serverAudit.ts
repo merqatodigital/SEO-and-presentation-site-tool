@@ -14,12 +14,18 @@ import {
   validatePublicTargetUrl,
 } from './serverShared.ts';
 import {
+  AI_CRAWLER_BOTS,
+  buildEntityCompletenessFromParsed,
+  parseRobotsAiBots,
+} from './src/audit/aiReadiness.ts';
+import {
   buildAutomatedFindings,
   evaluateHostSwitch,
   inspectHtmlContent,
   parseHtmlWithCheerio,
 } from './src/audit/htmlFindings.ts';
 import {
+  AiReadinessResult,
   AuditFinding,
   AuditNote,
   AuditResult,
@@ -873,7 +879,9 @@ export async function executeFullSiteAudit(
     rawHtml: string;
     contentResolution: HtmlContentResolution | null;
     robotsTxt: AuditResult['robotsTxt'];
+    robotsContent: string | null;
     sitemapXml: AuditResult['sitemapXml'];
+    llmsTxt: AiReadinessResult['llmsTxt'];
     speed: SpeedMetrics | null;
     speedReason: string | null;
   } = {
@@ -887,7 +895,9 @@ export async function executeFullSiteAudit(
     rawHtml: '',
     contentResolution: null,
     robotsTxt: { exists: null, allowsIndexing: null },
+    robotsContent: null,
     sitemapXml: { exists: null },
+    llmsTxt: { exists: null, url: null, bytes: null, preview: null },
     speed: null,
     speedReason: null,
   };
@@ -924,18 +934,32 @@ export async function executeFullSiteAudit(
       state.speedReason ??
       (state.speed === null && timedOut ? 'Audit took too long; partial results' : null);
 
+    const parsedFacts = resolution?.parsed ?? null;
     const findings = buildAutomatedFindings({
       isHttps: state.isHttps,
       fetchError: state.fetchError,
       contentError,
       ttfbMs: state.ttfbMs,
       ttfbSampleCount: state.ttfbSamplesMs.length,
-      parsed: resolution?.parsed ?? null,
+      parsed: parsedFacts,
       robotsTxt,
       sitemapXml,
       speed: state.speed,
       speedReason,
     });
+
+    const aiReadiness: AiReadinessResult = {
+      robotsChecked: robotsTxt.exists !== null,
+      botAccess:
+        robotsTxt.exists === null
+          ? AI_CRAWLER_BOTS.map((b) => ({ ...b, status: 'unknown' }))
+          : parseRobotsAiBots(state.robotsContent ?? ''),
+      llmsTxt:
+        state.llmsTxt.exists === null && !state.llmsTxt.reason && timedOut
+          ? { ...state.llmsTxt, reason: 'Audit took too long; partial results' }
+          : state.llmsTxt,
+      entityCompleteness: buildEntityCompletenessFromParsed(parsedFacts),
+    };
 
     return AuditResultSchema.parse({
       schemaVersion: '1.0',
@@ -953,7 +977,8 @@ export async function executeFullSiteAudit(
       ...(resolution?.redirectedFromHost
         ? { redirectedFromHost: resolution.redirectedFromHost }
         : {}),
-      parsed: resolution?.parsed ?? null,
+      aiReadiness,
+      parsed: parsedFacts,
       robotsTxt,
       sitemapXml,
       speed: state.speed,
@@ -1045,6 +1070,13 @@ export async function executeFullSiteAudit(
         exists: null,
         reason: 'This site blocks automated checks',
       };
+      state.llmsTxt = {
+        exists: null,
+        url: `${originUrl}/llms.txt`,
+        bytes: null,
+        preview: null,
+        reason: 'This site blocks automated checks',
+      };
     } else if (!state.fetchError || state.httpStatus !== null) {
       try {
         const robotsResp = await fetchHtml(`${originUrl}/robots.txt`, {
@@ -1058,8 +1090,10 @@ export async function executeFullSiteAudit(
             exists: true,
             allowsIndexing: parseRobotsAllowsIndexing(robotsResp.text),
           };
+          state.robotsContent = robotsResp.text;
         } else {
           state.robotsTxt = { exists: false, allowsIndexing: true };
+          state.robotsContent = '';
         }
       } catch (err) {
         if (!deadlineController.signal.aborted) {
@@ -1097,9 +1131,52 @@ export async function executeFullSiteAudit(
           }
         }
       }
+
+      if (!deadlineController.signal.aborted) {
+        try {
+          const llmsUrl = `${originUrl}/llms.txt`;
+          const llmsResp = await fetchHtml(llmsUrl, {
+            timeoutMs: 8000,
+            maxBytes: 128 * 1024,
+            maxRedirects: 3,
+            signal: deadlineController.signal,
+          });
+          const trimmed = llmsResp.text.trim();
+          const looksValidLlms =
+            llmsResp.statusCode >= 200 &&
+            llmsResp.statusCode < 300 &&
+            trimmed.length > 0 &&
+            !/^\s*<!doctype\s+html/i.test(trimmed) &&
+            !/^\s*<html\b/i.test(trimmed);
+          state.llmsTxt = {
+            exists: looksValidLlms,
+            url: llmsUrl,
+            bytes: looksValidLlms ? llmsResp.bytes : null,
+            preview: looksValidLlms ? trimmed.slice(0, 600) : null,
+            reason: looksValidLlms ? undefined : `No /llms.txt found (HTTP ${llmsResp.statusCode})`,
+          };
+        } catch (err) {
+          if (!deadlineController.signal.aborted) {
+            state.llmsTxt = {
+              exists: null,
+              url: `${originUrl}/llms.txt`,
+              bytes: null,
+              preview: null,
+              reason: err instanceof Error ? err.message : 'Unable to check /llms.txt',
+            };
+          }
+        }
+      }
     } else {
       state.robotsTxt = { exists: null, allowsIndexing: null, reason: state.fetchError };
       state.sitemapXml = { exists: null, reason: state.fetchError };
+      state.llmsTxt = {
+        exists: null,
+        url: `${originUrl}/llms.txt`,
+        bytes: null,
+        preview: null,
+        reason: state.fetchError,
+      };
     }
 
     if (deadlineController.signal.aborted) {

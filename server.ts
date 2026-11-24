@@ -16,6 +16,7 @@ import {
   attachPublicUrlRouteFilter,
   parseAllowedRelayHosts,
   requireCaptureToken,
+  resolveServerOllamaOrigin,
   sanitizePlaywrightNavigationError,
   sendTargetUrlError,
   validatePublicTargetUrl,
@@ -75,7 +76,7 @@ if (process.env.NODE_ENV === 'production') {
   app.use((_req, res, next) => {
     res.setHeader(
       'Content-Security-Policy',
-      "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' https:; frame-ancestors 'none'"
+      "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' https: http://localhost:11434 http://127.0.0.1:11434; frame-ancestors 'none'"
     );
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -216,6 +217,76 @@ app.post('/api/relay', relayPreAuthMiddleware, relayJsonParser, async (req, res)
     });
   } finally {
     clearTimeout(timeoutHandle);
+  }
+});
+
+app.get('/api/ollama/tags', relayPreAuthMiddleware, async (_req, res) => {
+  const ollamaOrigin = resolveServerOllamaOrigin(process.env.OLLAMA_URL);
+  if (!ollamaOrigin) {
+    res.status(404).json({ error: 'Local Ollama bridge is disabled.' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const upstream = await fetch(`${ollamaOrigin.origin}/api/tags`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    const text = await upstream.text();
+    res.status(upstream.status);
+    res.setHeader('Content-Type', 'application/json');
+    res.send(text);
+  } catch (err) {
+    res.status(502).json({
+      error:
+        err instanceof Error
+          ? `Ollama not reachable on ${ollamaOrigin.origin}: ${err.message}`
+          : 'Ollama not reachable.',
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+app.post('/api/ollama/chat', relayPreAuthMiddleware, relayJsonParser, async (req, res) => {
+  const ollamaOrigin = resolveServerOllamaOrigin(process.env.OLLAMA_URL);
+  if (!ollamaOrigin) {
+    res.status(404).json({ error: 'Local Ollama bridge is disabled.' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90_000);
+  try {
+    const upstream = await fetch(`${ollamaOrigin.origin}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(req.body ?? {}),
+      signal: controller.signal,
+    });
+    const text = await upstream.text();
+    res.status(upstream.status);
+    res.setHeader('Content-Type', 'application/json');
+    res.send(text);
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      res.status(504).json({ error: 'Local Ollama timed out after 90s.' });
+      return;
+    }
+    res.status(502).json({
+      error:
+        err instanceof Error
+          ? `Ollama request failed on ${ollamaOrigin.origin}: ${err.message}`
+          : 'Ollama request failed.',
+    });
+  } finally {
+    clearTimeout(timer);
   }
 });
 

@@ -1,14 +1,12 @@
-import React, { useState } from 'react';
+import React from 'react';
 import {
   Bot,
   Calendar,
   Check,
-  Copy,
   Download,
   Globe,
   Plus,
   Printer,
-  RotateCcw,
   Share2,
   Sparkles,
   Trash2,
@@ -26,7 +24,6 @@ import {
   ProposalOutcome,
   RoadmapQuarterPlan,
   WalkthroughData,
-  buildLlmsTxt,
   getAddedPricingTierDefaults,
   getContrastTextColor,
 } from '../types/tour';
@@ -47,7 +44,7 @@ interface ProposalSectionProps {
   onPricingChange: (tiers: PricingTier[]) => void;
   onCurrencyChange: (currency: CurrencyCode) => void;
   onAISearchLayerChange: (next: AISearchLayerData) => void;
-  onResetAISearchLayer: () => void;
+  onOpenAiVisibilityTab?: () => void;
   onExportJson: () => void;
   onPrintPdf: () => void;
 }
@@ -75,47 +72,12 @@ export const ProposalSection: React.FC<ProposalSectionProps> = ({
   onPricingChange,
   onCurrencyChange,
   onAISearchLayerChange,
-  onResetAISearchLayer,
+  onOpenAiVisibilityTab,
   onExportJson,
   onPrintPdf,
 }) => {
-  const [artifactTab, setArtifactTab] = useState<'jsonld' | 'llms'>('jsonld');
-  const [copiedArtifact, setCopiedArtifact] = useState(false);
-
   const brandContrast = getContrastTextColor(project.brandColor);
-
-  const llmsTxtContent = buildLlmsTxt(project, aiSearchLayer, walkthrough);
   const jsonLdResult = buildValidatedJsonLd(project, aiSearchLayer, audit, manualFootprint);
-  const activeArtifactText =
-    artifactTab === 'jsonld' ? jsonLdResult.scriptTag : llmsTxtContent;
-  const canExportArtifact = artifactTab === 'llms' || jsonLdResult.valid;
-
-  const handleCopyArtifact = async () => {
-    if (!canExportArtifact) return;
-    try {
-      await navigator.clipboard.writeText(activeArtifactText);
-      setCopiedArtifact(true);
-      window.setTimeout(() => setCopiedArtifact(false), 1800);
-    } catch {
-      // Ignore clipboard permission errors
-    }
-  };
-
-  const handleDownloadArtifact = () => {
-    if (!canExportArtifact) return;
-    const filename = artifactTab === 'jsonld' ? 'structured-data-schema.html' : 'llms.txt';
-    const mime =
-      artifactTab === 'jsonld' ? 'text/html;charset=utf-8' : 'text/plain;charset=utf-8';
-    const blob = new Blob([activeArtifactText], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  };
 
   const updateOutcome = (index: number, patch: Partial<ProposalOutcome>) => {
     const next = walkthrough.outcomes.map((item, idx) =>
@@ -526,33 +488,32 @@ export const ProposalSection: React.FC<ProposalSectionProps> = ({
         </div>
       </div>
 
-      {/* 3. Structured data (JSON-LD) */}
-      <div className="rounded-xl border border-slate-200 bg-white p-6 sm:p-8 dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-start sm:justify-between dark:border-slate-800">
+      {/* 3. AI Visibility & Structured Data Summary (Configured in Step 3) */}
+      <div className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6 dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="max-w-2xl">
             <p className="text-xs font-medium tracking-wide text-slate-500 dark:text-slate-400">
-              Machine-Readable Website Markup · Selected @type: {jsonLdResult.selectedType}
+              AI Search Layer · Schema @type: {jsonLdResult.selectedType} · {aiSearchLayer.faqs.length} Verified Q&amp;As
             </p>
-            <h3 className="mt-1 flex items-center gap-2 text-xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">
-              <Sparkles className="h-5 w-5 shrink-0" style={{ color: project.brandColor }} />
-              <span>Structured data (JSON-LD)</span>
+            <h3 className="mt-1 flex items-center gap-2 text-lg font-semibold text-slate-900 dark:text-slate-100">
+              <Sparkles className="h-4 w-4 shrink-0" style={{ color: project.brandColor }} />
+              <span>AI Readiness, Schema JSON-LD &amp; llms.txt Deliverables</span>
             </h3>
-            <p className="mt-1.5 text-sm leading-relaxed text-slate-600 dark:text-slate-400">
-              Populated automatically from your business type, manual NAP, opening hours, detected
-              profile links (<code className="font-mono text-xs">sameAs</code>), and verified Q&amp;As
-              without self-serving rating markup.
+            <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+              Verified business facts and Q&amp;As from Step 3 are embedded automatically in the printable proposal PDF when enabled.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={onResetAISearchLayer}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Sync from brief
-            </button>
+            {onOpenAiVisibilityTab && (
+              <button
+                type="button"
+                onClick={onOpenAiVisibilityTab}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap"
+              >
+                Edit in Step 3: AI Visibility →
+              </button>
+            )}
             <button
               type="button"
               onClick={() =>
@@ -563,248 +524,10 @@ export const ProposalSection: React.FC<ProposalSectionProps> = ({
                   ? { borderColor: project.brandColor, color: project.brandColor }
                   : undefined
               }
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap"
             >
               {aiSearchLayer.enabled ? 'Included in PDF' : 'Excluded from PDF'}
             </button>
-          </div>
-        </div>
-
-        <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-12">
-          {/* Left 7 columns: Client Business Facts & Q&A Editor */}
-          <div className="space-y-4 lg:col-span-7">
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
-                  Service Area / Location
-                </label>
-                <input
-                  type="text"
-                  value={aiSearchLayer.serviceArea}
-                  onChange={(e) =>
-                    onAISearchLayerChange({ ...aiSearchLayer, serviceArea: e.target.value })
-                  }
-                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
-                  Official Website / Booking URL
-                </label>
-                <input
-                  type="text"
-                  value={aiSearchLayer.websiteUrl}
-                  onChange={(e) =>
-                    onAISearchLayerChange({ ...aiSearchLayer, websiteUrl: e.target.value })
-                  }
-                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
-                Verified Summary &amp; Primary Services
-              </label>
-              <textarea
-                rows={2}
-                value={aiSearchLayer.primaryOffer}
-                onChange={(e) =>
-                  onAISearchLayerChange({ ...aiSearchLayer, primaryOffer: e.target.value })
-                }
-                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-              />
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
-                  Key Differentiator / Proof
-                </label>
-                <input
-                  type="text"
-                  value={aiSearchLayer.keyDifferentiator}
-                  onChange={(e) =>
-                    onAISearchLayerChange({ ...aiSearchLayer, keyDifferentiator: e.target.value })
-                  }
-                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
-                  Contact &amp; Booking Action
-                </label>
-                <input
-                  type="text"
-                  value={aiSearchLayer.contactInfo}
-                  onChange={(e) =>
-                    onAISearchLayerChange({ ...aiSearchLayer, contactInfo: e.target.value })
-                  }
-                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                />
-              </div>
-            </div>
-
-            {/* Editable AI Search Q&As */}
-            <div className="pt-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                  Verified Q&amp;As for ChatGPT &amp; Claude.ai
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onAISearchLayerChange({
-                      ...aiSearchLayer,
-                      faqs: [
-                        ...aiSearchLayer.faqs,
-                        {
-                          question: `What hours or availability does ${project.clientName || 'the business'} offer?`,
-                          answer: 'Share accurate opening hours, booking lead times, or response expectations.',
-                        },
-                      ],
-                    })
-                  }
-                  className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  Add Q&amp;A
-                </button>
-              </div>
-
-              <div className="mt-2.5 space-y-3">
-                {aiSearchLayer.faqs.map((qa, idx) => (
-                  <div
-                    key={idx}
-                    className="group rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <input
-                        type="text"
-                        value={qa.question}
-                        onChange={(e) => {
-                          const nextFaqs = aiSearchLayer.faqs.map((item, i) =>
-                            i === idx ? { ...item, question: e.target.value } : item
-                          );
-                          onAISearchLayerChange({ ...aiSearchLayer, faqs: nextFaqs });
-                        }}
-                        aria-label={`AI Q&A ${idx + 1} question`}
-                        className="w-full rounded border border-transparent bg-transparent px-1 py-0.5 text-sm font-medium text-slate-900 hover:border-slate-200 focus:border-slate-400 focus:bg-white focus:outline-none dark:text-slate-100 dark:hover:border-slate-700 dark:focus:bg-slate-900"
-                      />
-                      {aiSearchLayer.faqs.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onAISearchLayerChange({
-                              ...aiSearchLayer,
-                              faqs: aiSearchLayer.faqs.filter((_, i) => i !== idx),
-                            })
-                          }
-                          aria-label={`Remove Q&A ${idx + 1}`}
-                          className="rounded p-1 text-slate-400 opacity-0 transition-opacity hover:text-rose-600 group-hover:opacity-100 focus:opacity-100"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                    </div>
-                    <textarea
-                      rows={2}
-                      value={qa.answer}
-                      onChange={(e) => {
-                        const nextFaqs = aiSearchLayer.faqs.map((item, i) =>
-                          i === idx ? { ...item, answer: e.target.value } : item
-                        );
-                        onAISearchLayerChange({ ...aiSearchLayer, faqs: nextFaqs });
-                      }}
-                      aria-label={`AI Q&A ${idx + 1} answer`}
-                      className="mt-1 w-full resize-none rounded border border-transparent bg-transparent px-1 py-0.5 text-xs leading-relaxed text-slate-600 hover:border-slate-200 focus:border-slate-400 focus:bg-white focus:outline-none dark:text-slate-400 dark:hover:border-slate-700 dark:focus:bg-slate-900"
-                    />
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Right 5 columns: Ready-to-Publish JSON-LD & Experimental llms.txt Preview */}
-          <div className="flex flex-col rounded-xl border border-slate-200 bg-slate-950 text-slate-100 lg:col-span-5 dark:border-slate-800">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-3">
-              <div className="inline-flex rounded-lg bg-slate-900 p-0.5">
-                <button
-                  type="button"
-                  onClick={() => setArtifactTab('jsonld')}
-                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                    artifactTab === 'jsonld'
-                      ? 'bg-slate-800 text-white'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Schema JSON-LD
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setArtifactTab('llms')}
-                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                    artifactTab === 'llms'
-                      ? 'bg-slate-800 text-white'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Experimental: llms.txt
-                </button>
-              </div>
-
-              <div className="flex items-center gap-1.5">
-                {artifactTab === 'jsonld' && (
-                  <span
-                    className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-semibold ${
-                      jsonLdResult.valid ? 'text-emerald-400' : 'text-rose-400'
-                    }`}
-                  >
-                    <Check className="h-3.5 w-3.5" />
-                    <span>{jsonLdResult.valid ? 'Valid JSON' : 'Invalid JSON'}</span>
-                  </span>
-                )}
-                <button
-                  type="button"
-                  disabled={!canExportArtifact}
-                  onClick={() => void handleCopyArtifact()}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap shrink-0"
-                >
-                  {copiedArtifact ? (
-                    <>
-                      <Check className="h-3.5 w-3.5 text-emerald-400" />
-                      <span>Copied</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="h-3.5 w-3.5" />
-                      <span>Copy</span>
-                    </>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  disabled={!canExportArtifact}
-                  onClick={handleDownloadArtifact}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap shrink-0"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  <span>{artifactTab === 'jsonld' ? 'HTML' : 'llms.txt'}</span>
-                </button>
-              </div>
-            </div>
-
-            {artifactTab === 'llms' && (
-              <div className="border-b border-slate-800 bg-slate-900/80 px-4 py-2 text-xs text-amber-300">
-                No major search engine or AI assistant has confirmed it uses this. Optional.
-              </div>
-            )}
-
-            <pre className="max-h-[420px] flex-1 overflow-auto p-4 font-mono text-xs leading-relaxed text-slate-200 whitespace-pre-wrap break-words">
-              {activeArtifactText}
-            </pre>
           </div>
         </div>
       </div>

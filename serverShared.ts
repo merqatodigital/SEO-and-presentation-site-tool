@@ -301,6 +301,25 @@ export function validateRelayUrlBeforeDns(rawUrl: string, allowedHosts: Set<stri
   return parsed;
 }
 
+export function resolveServerOllamaOrigin(rawEnv?: string): URL | null {
+  const candidate = (rawEnv || 'http://127.0.0.1:11434').trim().replace(/\/+$/, '');
+  if (!candidate || candidate.toLowerCase() === 'disabled' || candidate.toLowerCase() === 'none') {
+    return null;
+  }
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    if (parsed.username || parsed.password) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export function sanitizePlaywrightNavigationError(rawMessage: string): string {
   if (/net::ERR_ACCESS_DENIED/i.test(rawMessage)) {
     return 'Access to the target website was blocked by security policy.';

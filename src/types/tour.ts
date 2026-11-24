@@ -1,10 +1,12 @@
 import { z } from 'zod';
 import type {
+  AiMentionCheckResult,
   AuditAssumptions,
   AuditResult,
   ManualFootprint,
   ProspectEntry,
   Scorecard,
+  SiteAnalysisReport,
 } from '../audit/types';
 
 export type RoadmapQuarter = 'Q1' | 'Q2' | 'Q3' | 'Q4';
@@ -117,6 +119,8 @@ export interface AISettings {
   baseUrl: string;
   apiKey: string;
   model: string;
+  analysisModel?: string;
+  providerPreset?: 'openrouter-free' | 'openrouter-paid' | 'nvidia' | 'ollama' | 'custom';
   captureUrl: string;
   captureToken: string;
 }
@@ -135,6 +139,8 @@ export interface FullProjectBundle {
   assumptions?: AuditAssumptions | null;
   scorecard?: Scorecard | null;
   prospects?: ProspectEntry[];
+  aiMentionCheck?: AiMentionCheckResult | null;
+  siteAnalysisReport?: SiteAnalysisReport | null;
 }
 
 export const CURRENT_BUNDLE_SCHEMA_VERSION = '2.0';
@@ -143,6 +149,8 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
   baseUrl: 'https://openrouter.ai/api/v1',
   apiKey: '',
   model: '',
+  analysisModel: '',
+  providerPreset: 'openrouter-free',
   captureUrl: '/api',
   captureToken: '',
 };
@@ -196,10 +204,19 @@ export function buildDefaultAISearchLayer(
 export function buildLlmsTxt(
   project: ProjectBrief,
   aiSearch: AISearchLayerData,
-  walkthrough: WalkthroughData
+  walkthrough?: WalkthroughData | null
 ): string {
   const name = project.clientName.trim() || 'Client Business';
   const type = project.businessType.trim() || 'Business';
+  const outcomesSection =
+    walkthrough && walkthrough.outcomes.length > 0
+      ? [
+          '',
+          '## Core Customer Outcomes',
+          ...walkthrough.outcomes.map((o) => `- **${o.title}**: ${o.description}`),
+        ]
+      : [];
+
   const lines: string[] = [
     `# ${name}`,
     '',
@@ -212,9 +229,7 @@ export function buildLlmsTxt(
     `- Official Website: ${aiSearch.websiteUrl}`,
     `- Contact & Booking: ${aiSearch.contactInfo}`,
     `- Key Differentiator: ${aiSearch.keyDifferentiator}`,
-    '',
-    '## Core Customer Outcomes',
-    ...walkthrough.outcomes.map((o) => `- **${o.title}**: ${o.description}`),
+    ...outcomesSection,
     '',
     '## Common Questions & Verified Answers',
     ...aiSearch.faqs.flatMap((qa) => [`### ${qa.question}`, qa.answer, '']),

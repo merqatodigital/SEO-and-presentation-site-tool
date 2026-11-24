@@ -1,25 +1,46 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Moon, SlidersHorizontal, Sun } from 'lucide-react';
+import {
+  ArrowLeft,
+  ArrowRight,
+  CheckCircle2,
+  Loader2,
+  Moon,
+  Play,
+  SlidersHorizontal,
+  Sparkles,
+  Sun,
+} from 'lucide-react';
+import { buildAiReadinessSummary } from './audit/aiReadiness';
 import { runSiteAudit } from './audit/auditClient';
 import { migrateImportedBundle } from './audit/bundleMigration';
 import { deriveClientName } from './audit/htmlFindings';
 import { buildSampleAudit } from './audit/sampleAudit';
 import { computeScorecard } from './audit/scorecard';
 import {
+  AiMentionCheckResult,
   AuditAssumptions,
   AuditResult,
   ManualFootprint,
   ProspectEntry,
+  SiteAnalysisReport,
   createDefaultAssumptions,
   createEmptyManualFootprint,
 } from './audit/types';
+import { AiVisibilityTab } from './components/AiVisibilityTab';
 import { AuditSection, AuditTabId } from './components/AuditSection';
 import { IntakeStudio } from './components/IntakeStudio';
 import { PrintProposalView } from './components/PrintProposalView';
 import { ProposalSection } from './components/ProposalSection';
 import { SettingsModal } from './components/SettingsModal';
+import { SiteAnalysisAgentPanel } from './components/SiteAnalysisAgentPanel';
 import { WalkthroughPlayer } from './components/WalkthroughPlayer';
-import { generateWalkthrough } from './lib/aiClient';
+import {
+  generateWalkthrough,
+  getEffectiveAnalysisModel,
+  isOllamaBaseUrl,
+  runAiBrandMentionCheck,
+  runSiteAnalysisAgent,
+} from './lib/aiClient';
 import { captureWebsite } from './lib/captureClient';
 import {
   SAMPLE_PROJECT_BRIEF,
@@ -47,12 +68,22 @@ import {
   buildDefaultAISearchLayer,
   convertPricingTiersCurrency,
   createWalkthroughSchema,
+  getContrastTextColor,
 } from './types/tour';
 
 const SETTINGS_STORAGE_KEY = 'tourforge_ai_settings_v1';
 const THEME_STORAGE_KEY = 'tourforge_theme_v1';
 const PROSPECTS_STORAGE_KEY = 'tourforge_prospects_v1';
 const MANUAL_STORAGE_PREFIX = 'tourforge_manual_footprint_v1:';
+
+const AUDIT_PROGRESS_LABELS = [
+  'Fetching page',
+  'Parsing HTML & AI bots',
+  'Speed test (Lighthouse)',
+  'Scoring findings',
+];
+
+type PipelineStep = 1 | 2 | 3 | 4;
 
 const EMPTY_PROJECT: ProjectBrief = {
   clientName: '',
@@ -73,6 +104,8 @@ function loadInitialSettings(): AISettings {
       baseUrl: parsed.baseUrl || DEFAULT_AI_SETTINGS.baseUrl,
       apiKey: parsed.apiKey || '',
       model: parsed.model || '',
+      analysisModel: parsed.analysisModel || '',
+      providerPreset: parsed.providerPreset || DEFAULT_AI_SETTINGS.providerPreset,
       captureUrl: parsed.captureUrl || DEFAULT_AI_SETTINGS.captureUrl,
       captureToken: parsed.captureToken || '',
     };
@@ -118,6 +151,7 @@ export default function App() {
   const [theme, setTheme] = useState<'light' | 'dark'>(loadInitialTheme);
   const [aiSettings, setAiSettings] = useState<AISettings>(loadInitialSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [activeStep, setActiveStep] = useState<PipelineStep>(1);
 
   const [project, setProject] = useState<ProjectBrief>(EMPTY_PROJECT);
   const [screenshots, setScreenshots] = useState<ScreenshotAsset[]>([]);
@@ -130,7 +164,7 @@ export default function App() {
   );
 
   // Audit & Lead-Magnet States
-  const [auditTab, setAuditTab] = useState<AuditTabId>('auto');
+  const [auditTab, setAuditTab] = useState<AuditTabId>('scorecard');
   const [audit, setAudit] = useState<AuditResult | null>(null);
   const [manualFootprint, setManualFootprint] = useState<ManualFootprint>(
     createEmptyManualFootprint
@@ -142,6 +176,16 @@ export default function App() {
   const [auditError, setAuditError] = useState<string | null>(null);
   const [printMode, setPrintMode] = useState<'scorecard' | 'proposal'>('proposal');
 
+  // AI Mention Check & Site Analysis Agent States
+  const [aiMentionCheck, setAiMentionCheck] = useState<AiMentionCheckResult | null>(null);
+  const [isCheckingMentions, setIsCheckingMentions] = useState(false);
+  const [mentionCheckError, setMentionCheckError] = useState<string | null>(null);
+
+  const [siteAnalysisReport, setSiteAnalysisReport] = useState<SiteAnalysisReport | null>(null);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [reportStage, setReportStage] = useState('');
+  const [reportError, setReportError] = useState<string | null>(null);
+
   const [isCapturing, setIsCapturing] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -152,6 +196,8 @@ export default function App() {
     () => computeScorecard(audit, manualFootprint, assumptions),
     [audit, manualFootprint, assumptions]
   );
+
+  const aiReadinessSummary = useMemo(() => buildAiReadinessSummary(audit), [audit]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -167,7 +213,6 @@ export default function App() {
     }
   }, [theme]);
 
-  // Persist prospects list in localStorage
   useEffect(() => {
     try {
       localStorage.setItem(PROSPECTS_STORAGE_KEY, JSON.stringify(prospects));
@@ -176,7 +221,6 @@ export default function App() {
     }
   }, [prospects]);
 
-  // Autosave manual footprint per project key
   useEffect(() => {
     const key = getManualStorageKey(project.websiteUrl || '', project.clientName);
     try {
@@ -197,6 +241,8 @@ export default function App() {
   const handleSaveSettings = (next: AISettings) => {
     setAiSettings(next);
     setErrorMessage(null);
+    setMentionCheckError(null);
+    setReportError(null);
     try {
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
     } catch {
@@ -204,10 +250,23 @@ export default function App() {
     }
   };
 
+  const hasValidAuth =
+    isOllamaBaseUrl(aiSettings.baseUrl) || aiSettings.apiKey.trim().length > 0;
+
   const hasConfiguredAI =
     aiSettings.baseUrl.trim().length > 0 &&
-    aiSettings.apiKey.trim().length > 0 &&
+    hasValidAuth &&
     aiSettings.model.trim().length > 0;
+
+  const hasConfiguredAnalysisAI =
+    aiSettings.baseUrl.trim().length > 0 &&
+    hasValidAuth &&
+    getEffectiveAnalysisModel(aiSettings).length > 0;
+
+  const navigateToStep = (step: PipelineStep) => {
+    setActiveStep(step);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
   const handleCaptureSite = async (websiteUrl: string) => {
     setCaptureError(null);
@@ -231,16 +290,18 @@ export default function App() {
         defaultLabel: '',
       });
 
-      const nextProject: ProjectBrief = {
-        ...project,
-        websiteUrl: result.pageFacts.url || websiteUrl,
-        clientName:
-          derivedCaptureName && !project.clientName.trim()
-            ? derivedCaptureName
-            : project.clientName,
-      };
-      setProject(nextProject);
-      setAiSearchLayer(buildDefaultAISearchLayer(nextProject, result.pageFacts, walkthrough));
+      setProject((prev) => {
+        const nextProject: ProjectBrief = {
+          ...prev,
+          websiteUrl: result.pageFacts.url || websiteUrl,
+          clientName:
+            derivedCaptureName && !prev.clientName.trim()
+              ? derivedCaptureName
+              : prev.clientName,
+        };
+        setAiSearchLayer(buildDefaultAISearchLayer(nextProject, result.pageFacts, walkthrough));
+        return nextProject;
+      });
     } catch (err) {
       setCaptureError(err instanceof Error ? err.message : 'Unable to capture website.');
     } finally {
@@ -272,25 +333,36 @@ export default function App() {
         fallbackUrl: resolvedUrl,
         defaultLabel: '',
       });
-      const nextProject: ProjectBrief = {
-        ...project,
-        websiteUrl: resolvedUrl,
-        clientName:
-          !project.clientName.trim() && derivedAuditName
-            ? derivedAuditName
-            : project.clientName,
-      };
-      setProject(nextProject);
 
-      if (!pageFacts && result.parsed) {
-        setPageFacts({
+      let synthesizedFacts: PageFacts | null = pageFacts;
+      if (!synthesizedFacts && result.parsed) {
+        synthesizedFacts = {
           url: resolvedUrl,
           title: result.parsed.title,
           description: result.parsed.metaDescription,
           headings: result.parsed.headings,
           ctas: result.parsed.ctaTexts,
-        });
+        };
+        setPageFacts(synthesizedFacts);
       }
+
+      setProject((prev) => {
+        const nextProject: ProjectBrief = {
+          ...prev,
+          websiteUrl: resolvedUrl,
+          clientName:
+            !prev.clientName.trim() && derivedAuditName
+              ? derivedAuditName
+              : prev.clientName,
+        };
+        setAiSearchLayer((curr) =>
+          curr.websiteUrl === 'https://example.com'
+            ? buildDefaultAISearchLayer(nextProject, synthesizedFacts, walkthrough)
+            : curr
+        );
+        return nextProject;
+      });
+      setAuditTab('scorecard');
     } catch (err) {
       setAuditError(err instanceof Error ? err.message : 'Unable to run site audit.');
     } finally {
@@ -298,6 +370,10 @@ export default function App() {
       window.clearTimeout(t2);
       setIsAuditing(false);
     }
+  };
+
+  const handleScanAndCapture = async (websiteUrl: string) => {
+    await Promise.allSettled([handleRunAudit(websiteUrl), handleCaptureSite(websiteUrl)]);
   };
 
   const handleLoadSampleAudit = () => {
@@ -336,14 +412,66 @@ export default function App() {
       setManualFootprint(createEmptyManualFootprint());
     }
     setAuditTab('scorecard');
+    navigateToStep(2);
   };
 
   const handlePromoteProspect = (prospect: ProspectEntry) => {
     handleOpenProspectScorecard(prospect);
-    setAuditTab('scorecard');
-    setTimeout(() => {
-      document.getElementById('studio')?.scrollIntoView({ behavior: 'smooth' });
-    }, 100);
+  };
+
+  const handleRunMentionCheck = async () => {
+    setMentionCheckError(null);
+    if (!hasConfiguredAnalysisAI) {
+      setSettingsOpen(true);
+      return;
+    }
+    setIsCheckingMentions(true);
+    try {
+      const result = await runAiBrandMentionCheck({
+        settings: aiSettings,
+        project,
+        audit,
+        aiSearchLayer,
+      });
+      setAiMentionCheck(result);
+    } catch (err) {
+      setMentionCheckError(
+        err instanceof Error ? err.message : 'Unable to run AI Brand Mention Check.'
+      );
+    } finally {
+      setIsCheckingMentions(false);
+    }
+  };
+
+  const handleGenerateSiteReport = async () => {
+    setReportError(null);
+    if (!hasConfiguredAnalysisAI) {
+      setSettingsOpen(true);
+      return;
+    }
+    setIsGeneratingReport(true);
+    setReportStage('Analyzing scorecard, AI visibility & GBP facts...');
+    try {
+      const report = await runSiteAnalysisAgent({
+        settings: aiSettings,
+        project,
+        audit,
+        scorecard,
+        manualFootprint,
+        aiSearchLayer,
+        aiMentionCheck,
+        pageFacts,
+        onStage: setReportStage,
+      });
+      setSiteAnalysisReport(report);
+    } catch (err) {
+      setReportError(
+        err instanceof Error ? err.message : 'Site Analysis Agent failed.'
+      );
+    } finally {
+      setIsGeneratingReport(false);
+      setReportStage('');
+    }
   };
 
   const handleGenerate = async () => {
@@ -351,12 +479,14 @@ export default function App() {
 
     if (!hasConfiguredAI) {
       setSettingsOpen(true);
-      setErrorMessage('Configure your AI Base URL, API key, and model name in Settings first.');
+      setErrorMessage(
+        'Configure your AI provider and Vision-capable Walkthrough model in Settings first.'
+      );
       return;
     }
 
     if (screenshots.length < 3 || screenshots.length > 6) {
-      setErrorMessage('Please upload between 3 and 6 website screenshots.');
+      setErrorMessage('Please upload or capture between 3 and 6 website screenshots.');
       return;
     }
 
@@ -376,9 +506,7 @@ export default function App() {
       });
       setWalkthrough(generated);
       setAiSearchLayer(buildDefaultAISearchLayer(project, pageFacts, generated));
-      setTimeout(() => {
-        document.getElementById('walkthrough')?.scrollIntoView({ behavior: 'smooth' });
-      }, 120);
+      navigateToStep(4);
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Generation failed.');
     } finally {
@@ -392,12 +520,16 @@ export default function App() {
     setCaptureError(null);
     setPageFacts(null);
     const sampleAudit = buildSampleAudit();
-    setProject({
+    const nextProject: ProjectBrief = {
       ...SAMPLE_PROJECT_BRIEF,
       websiteUrl: sampleAudit.audit.requestedUrl,
-    });
+    };
+    setProject(nextProject);
     setScreenshots(buildSampleScreenshots());
-    setAiSearchLayer(buildDefaultAISearchLayer(SAMPLE_PROJECT_BRIEF, null, null));
+    setAudit(sampleAudit.audit);
+    setManualFootprint(sampleAudit.manualFootprint);
+    setAssumptions(sampleAudit.assumptions);
+    setAiSearchLayer(buildDefaultAISearchLayer(nextProject, null, null));
   };
 
   const handlePreviewSampleTour = () => {
@@ -418,9 +550,7 @@ export default function App() {
     setFootprint(DEFAULT_FOOTPRINT);
     setPricingTiers(DEFAULT_PRICING_TIERS);
     setAiSearchLayer(buildDefaultAISearchLayer(sampleProject, null, SAMPLE_WALKTHROUGH));
-    setTimeout(() => {
-      document.getElementById('walkthrough')?.scrollIntoView({ behavior: 'smooth' });
-    }, 120);
+    navigateToStep(4);
   };
 
   const handleImportJson = async (file: File) => {
@@ -471,6 +601,10 @@ export default function App() {
       if (migrated.manualFootprint) setManualFootprint(migrated.manualFootprint);
       if (migrated.assumptions) setAssumptions(migrated.assumptions);
       if (Array.isArray(migrated.prospects)) setProspects(migrated.prospects);
+      if (migrated.aiMentionCheck !== undefined) setAiMentionCheck(migrated.aiMentionCheck);
+      if (migrated.siteAnalysisReport !== undefined) {
+        setSiteAnalysisReport(migrated.siteAnalysisReport);
+      }
 
       if (Array.isArray(migrated.footprint) && migrated.footprint.length === 4) {
         setFootprint(migrated.footprint);
@@ -489,14 +623,15 @@ export default function App() {
           setScreenshots(buildSampleScreenshots());
         }
         setWalkthrough(parsed.data);
-        setTimeout(() => {
-          document.getElementById('walkthrough')?.scrollIntoView({ behavior: 'smooth' });
-        }, 120);
+        navigateToStep(4);
       } else if (migrated.audit) {
+        if (migrated.aiSearchLayer) {
+          setAiSearchLayer(migrated.aiSearchLayer);
+        } else {
+          setAiSearchLayer(buildDefaultAISearchLayer(nextProject, nextFacts, null));
+        }
         setAuditTab('scorecard');
-        setTimeout(() => {
-          document.getElementById('audit')?.scrollIntoView({ behavior: 'smooth' });
-        }, 120);
+        navigateToStep(2);
       }
     } catch (err) {
       setErrorMessage(
@@ -520,6 +655,8 @@ export default function App() {
       assumptions,
       scorecard,
       prospects,
+      aiMentionCheck,
+      siteAnalysisReport,
     };
     const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -577,51 +714,90 @@ export default function App() {
     setPricingTiers((prev) => convertPricingTiersCurrency(prev, nextCurrency));
   };
 
+  const brandContrast = getContrastTextColor(project.brandColor);
+  const screenshotCountValid = screenshots.length >= 3 && screenshots.length <= 6;
+  const briefValid =
+    project.clientName.trim().length > 0 &&
+    project.businessType.trim().length > 0 &&
+    project.brief.trim().length > 0;
   const showPrintableLayer = Boolean(walkthrough || audit || scorecard.knownChecks > 0);
+
+  const pipelineSteps: Array<{
+    step: PipelineStep;
+    title: string;
+    subtitle: string;
+    done: boolean;
+  }> = [
+    {
+      step: 1,
+      title: '1. Intake & Scan',
+      subtitle: audit
+        ? `${screenshots.length} screens · Site scanned`
+        : screenshots.length > 0
+        ? `${screenshots.length}/6 screens ready`
+        : 'URL scan & brief',
+      done: Boolean(audit || screenshots.length >= 3),
+    },
+    {
+      step: 2,
+      title: '2. Scorecard & GBP',
+      subtitle:
+        scorecard.overallScore !== null
+          ? `${scorecard.overallScore}/100 (${scorecard.grade})`
+          : 'Scorecard & competitors',
+      done: scorecard.knownChecks > 0,
+    },
+    {
+      step: 3,
+      title: '3. AI Visibility',
+      subtitle:
+        aiReadinessSummary.score !== null
+          ? `${aiReadinessSummary.score}/100 · ${aiReadinessSummary.allowedBotsCount}/${aiReadinessSummary.totalBotsCount} bots`
+          : 'Bots, llms.txt & mentions',
+      done: Boolean(audit?.aiReadiness || aiMentionCheck),
+    },
+    {
+      step: 4,
+      title: '4. Report & Proposal',
+      subtitle: siteAnalysisReport
+        ? 'Agent report ready'
+        : walkthrough
+        ? 'Walkthrough & pricing'
+        : 'AI report & 2027 pitch',
+      done: Boolean(siteAnalysisReport || walkthrough),
+    },
+  ];
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 transition-colors dark:bg-slate-950 dark:text-slate-100">
       {/* Three-Zone Top Bar */}
       <header className="no-print sticky top-0 z-40 border-b border-slate-200 bg-white/95 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/95">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-8 px-4 py-3.5 sm:px-6">
-          {/* Zone 1: Single-line Brand Wordmark */}
-          <a
-            href="#studio"
-            className="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0"
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-6 px-4 py-3 sm:px-6">
+          {/* Zone 1: Brand Wordmark */}
+          <button
+            type="button"
+            onClick={() => navigateToStep(1)}
+            className="text-left text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0"
           >
             TourForge Lite
-          </a>
+          </button>
 
-          {/* Zone 2: Clean Single-Line Nav Links */}
-          <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-400">
-            <a
-              href="#studio"
-              className="transition-colors hover:text-slate-900 dark:hover:text-slate-100 whitespace-nowrap shrink-0"
-            >
-              Inputs
-            </a>
-            <a
-              href="#audit"
-              className="transition-colors hover:text-slate-900 dark:hover:text-slate-100 whitespace-nowrap shrink-0"
-            >
-              Audit
-            </a>
-            {walkthrough && (
-              <>
-                <a
-                  href="#walkthrough"
-                  className="transition-colors hover:text-slate-900 dark:hover:text-slate-100 whitespace-nowrap shrink-0"
-                >
-                  Walkthrough
-                </a>
-                <a
-                  href="#proposal"
-                  className="transition-colors hover:text-slate-900 dark:hover:text-slate-100 whitespace-nowrap shrink-0"
-                >
-                  Proposal
-                </a>
-              </>
-            )}
+          {/* Zone 2: Clean Step Links */}
+          <nav className="hidden md:flex items-center gap-5 text-sm font-medium">
+            {pipelineSteps.map((item) => (
+              <button
+                key={item.step}
+                type="button"
+                onClick={() => navigateToStep(item.step)}
+                className={`transition-colors whitespace-nowrap shrink-0 ${
+                  activeStep === item.step
+                    ? 'font-semibold text-slate-950 underline decoration-2 underline-offset-8 dark:text-white'
+                    : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100'
+                }`}
+              >
+                {item.title}
+              </button>
+            ))}
           </nav>
 
           {/* Zone 3: Theme Toggle + Settings Action */}
@@ -641,96 +817,275 @@ export default function App() {
               className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white whitespace-nowrap shrink-0"
             >
               <SlidersHorizontal className="h-3.5 w-3.5" />
-              <span>Settings</span>
+              <span>AI &amp; Settings</span>
             </button>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl space-y-14 px-4 py-8 sm:px-6 sm:py-10">
-        <IntakeStudio
-          project={project}
-          screenshots={screenshots}
-          pageFacts={pageFacts}
-          isCapturing={isCapturing}
-          captureError={captureError}
-          isGenerating={isGenerating}
-          generationStage={generationStage}
-          errorMessage={errorMessage}
-          hasConfiguredAI={hasConfiguredAI}
-          onProjectChange={setProject}
-          onScreenshotsChange={setScreenshots}
-          onCaptureSite={(url) => void handleCaptureSite(url)}
-          onClearPageFacts={() => setPageFacts(null)}
-          onGenerate={() => void handleGenerate()}
-          onLoadSampleInputs={handleLoadSampleInputs}
-          onPreviewSampleTour={handlePreviewSampleTour}
-          onImportJson={(file) => void handleImportJson(file)}
-          onOpenSettings={() => setSettingsOpen(true)}
-        />
+      <main className="mx-auto max-w-6xl space-y-8 px-4 py-6 sm:px-6 sm:py-8">
+        {/* Step 1 -> Step 4 Pipeline Switcher Bar */}
+        <div
+          aria-label="Agency audit and proposal pipeline"
+          className="no-print grid grid-cols-2 gap-2.5 lg:grid-cols-4"
+        >
+          {pipelineSteps.map((item) => {
+            const isCurrent = activeStep === item.step;
+            return (
+              <button
+                key={item.step}
+                type="button"
+                onClick={() => navigateToStep(item.step)}
+                className={`flex items-center justify-between gap-3 rounded-xl border px-4 py-3 text-left transition-colors ${
+                  isCurrent
+                    ? 'border-slate-900 bg-white dark:border-slate-100 dark:bg-slate-900'
+                    : 'border-slate-200 bg-white/70 hover:border-slate-300 hover:bg-white dark:border-slate-800 dark:bg-slate-900/60 dark:hover:border-slate-700 dark:hover:bg-slate-900'
+                }`}
+              >
+                <div className="min-w-0">
+                  <p
+                    className={`truncate text-xs font-semibold ${
+                      isCurrent
+                        ? 'text-slate-950 dark:text-white'
+                        : 'text-slate-700 dark:text-slate-300'
+                    }`}
+                  >
+                    {item.title}
+                  </p>
+                  <p className="mt-0.5 truncate text-[11px] text-slate-500 tabular-nums dark:text-slate-400">
+                    {item.subtitle}
+                  </p>
+                </div>
+                {item.done && (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                )}
+              </button>
+            );
+          })}
+        </div>
 
-        <AuditSection
-          activeTab={auditTab}
-          onTabChange={setAuditTab}
-          auditUrl={project.websiteUrl || ''}
-          onAuditUrlChange={(url) => setProject((prev) => ({ ...prev, websiteUrl: url }))}
-          isAuditing={isAuditing}
-          auditStageIndex={auditStageIndex}
-          auditError={auditError}
-          audit={audit}
-          manualFootprint={manualFootprint}
-          assumptions={assumptions}
-          scorecard={scorecard}
-          project={project}
-          prospects={prospects}
-          captureUrl={aiSettings.captureUrl}
-          captureToken={aiSettings.captureToken}
-          onRunAudit={(url) => void handleRunAudit(url)}
-          onLoadSampleAudit={handleLoadSampleAudit}
-          onManualFootprintChange={setManualFootprint}
-          onAssumptionsChange={setAssumptions}
-          onCurrencyChange={handleCurrencyChange}
-          onProspectsChange={setProspects}
-          onOpenProspectScorecard={handleOpenProspectScorecard}
-          onPromoteProspect={handlePromoteProspect}
-          onPrintScorecard={handlePrintScorecard}
-          onExportAuditJson={() => downloadBundleJson('audit')}
-        />
-
-        {walkthrough && (
-          <>
-            <WalkthroughPlayer
-              walkthrough={walkthrough}
-              screenshots={screenshots}
-              brandColor={project.brandColor}
-              onUpdateScene={handleUpdateScene}
-            />
-
-            <ProposalSection
-              project={project}
-              walkthrough={walkthrough}
-              footprint={footprint}
-              pricingTiers={pricingTiers}
-              currency={activeCurrency}
-              aiSearchLayer={aiSearchLayer}
-              audit={audit}
-              manualFootprint={manualFootprint}
-              onTitleChange={handleTitleChange}
-              onOutcomesChange={handleOutcomesChange}
-              onRoadmapChange={handleRoadmapChange}
-              onFootprintChange={setFootprint}
-              onPricingChange={setPricingTiers}
-              onCurrencyChange={handleCurrencyChange}
-              onAISearchLayerChange={setAiSearchLayer}
-              onResetAISearchLayer={() =>
-                setAiSearchLayer(buildDefaultAISearchLayer(project, pageFacts, walkthrough))
-              }
-              onExportJson={() => downloadBundleJson('walkthrough')}
-              onPrintPdf={handlePrintPdf}
-            />
-          </>
+        {/* STEP 1: Intake & Scan */}
+        {activeStep === 1 && (
+          <IntakeStudio
+            project={project}
+            screenshots={screenshots}
+            pageFacts={pageFacts}
+            isCapturing={isCapturing}
+            captureError={captureError}
+            isAuditing={isAuditing}
+            auditStageLabel={AUDIT_PROGRESS_LABELS[auditStageIndex] || 'Scanning...'}
+            auditError={auditError}
+            audit={audit}
+            scorecard={scorecard}
+            prospects={prospects}
+            captureUrl={aiSettings.captureUrl}
+            captureToken={aiSettings.captureToken}
+            isGenerating={isGenerating}
+            generationStage={generationStage}
+            errorMessage={errorMessage}
+            hasConfiguredAI={hasConfiguredAI}
+            onProjectChange={setProject}
+            onScreenshotsChange={setScreenshots}
+            onScanAndCapture={(url) => void handleScanAndCapture(url)}
+            onCaptureOnly={(url) => void handleCaptureSite(url)}
+            onAuditOnly={(url) => void handleRunAudit(url)}
+            onClearPageFacts={() => setPageFacts(null)}
+            onGenerate={() => void handleGenerate()}
+            onLoadSampleInputs={handleLoadSampleInputs}
+            onPreviewSampleTour={handlePreviewSampleTour}
+            onImportJson={(file) => void handleImportJson(file)}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onGoToStep={navigateToStep}
+            onProspectsChange={setProspects}
+            onOpenProspectScorecard={handleOpenProspectScorecard}
+            onPromoteProspect={handlePromoteProspect}
+          />
         )}
 
+        {/* STEP 2: Scorecard & GBP */}
+        {activeStep === 2 && (
+          <AuditSection
+            activeTab={auditTab}
+            onTabChange={setAuditTab}
+            auditUrl={project.websiteUrl || ''}
+            onAuditUrlChange={(url) => setProject((prev) => ({ ...prev, websiteUrl: url }))}
+            isAuditing={isAuditing}
+            auditStageIndex={auditStageIndex}
+            auditError={auditError}
+            audit={audit}
+            manualFootprint={manualFootprint}
+            assumptions={assumptions}
+            scorecard={scorecard}
+            project={project}
+            onRunAudit={(url) => void handleRunAudit(url)}
+            onLoadSampleAudit={handleLoadSampleAudit}
+            onManualFootprintChange={setManualFootprint}
+            onAssumptionsChange={setAssumptions}
+            onCurrencyChange={handleCurrencyChange}
+            onPrintScorecard={handlePrintScorecard}
+            onExportAuditJson={() => downloadBundleJson('audit')}
+          />
+        )}
+
+        {/* STEP 3: Standalone AI Visibility */}
+        {activeStep === 3 && (
+          <AiVisibilityTab
+            project={project}
+            audit={audit}
+            manualFootprint={manualFootprint}
+            aiSearchLayer={aiSearchLayer}
+            walkthrough={walkthrough}
+            aiSettings={aiSettings}
+            hasConfiguredAnalysisAI={hasConfiguredAnalysisAI}
+            aiMentionCheck={aiMentionCheck}
+            isCheckingMentions={isCheckingMentions}
+            mentionCheckError={mentionCheckError}
+            onAISearchLayerChange={setAiSearchLayer}
+            onResetAISearchLayer={() =>
+              setAiSearchLayer(buildDefaultAISearchLayer(project, pageFacts, walkthrough))
+            }
+            onRunMentionCheck={() => void handleRunMentionCheck()}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        )}
+
+        {/* STEP 4: Site Analysis Agent, Walkthrough & Proposal */}
+        {activeStep === 4 && (
+          <div id="step-4" className="no-print space-y-8">
+            <div className="flex flex-col gap-2">
+              <p className="text-xs font-medium tracking-wide text-slate-500 dark:text-slate-400">
+                Step 4 · AI Analysis Report, Walkthrough &amp; 2027 Proposal
+              </p>
+              <h2 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100 [text-wrap:balance]">
+                Deliver Client Report, Interactive Walkthrough &amp; Pricing Proposal
+              </h2>
+            </div>
+
+            <SiteAnalysisAgentPanel
+              project={project}
+              aiSettings={aiSettings}
+              hasConfiguredAnalysisAI={hasConfiguredAnalysisAI}
+              report={siteAnalysisReport}
+              isGeneratingReport={isGeneratingReport}
+              reportStage={reportStage}
+              reportError={reportError}
+              onGenerateReport={() => void handleGenerateSiteReport()}
+              onOpenSettings={() => setSettingsOpen(true)}
+            />
+
+            {walkthrough ? (
+              <>
+                <WalkthroughPlayer
+                  walkthrough={walkthrough}
+                  screenshots={screenshots}
+                  brandColor={project.brandColor}
+                  onUpdateScene={handleUpdateScene}
+                />
+
+                <ProposalSection
+                  project={project}
+                  walkthrough={walkthrough}
+                  footprint={footprint}
+                  pricingTiers={pricingTiers}
+                  currency={activeCurrency}
+                  aiSearchLayer={aiSearchLayer}
+                  audit={audit}
+                  manualFootprint={manualFootprint}
+                  onTitleChange={handleTitleChange}
+                  onOutcomesChange={handleOutcomesChange}
+                  onRoadmapChange={handleRoadmapChange}
+                  onFootprintChange={setFootprint}
+                  onPricingChange={setPricingTiers}
+                  onCurrencyChange={handleCurrencyChange}
+                  onAISearchLayerChange={setAiSearchLayer}
+                  onOpenAiVisibilityTab={() => navigateToStep(3)}
+                  onExportJson={() => downloadBundleJson('walkthrough')}
+                  onPrintPdf={handlePrintPdf}
+                />
+              </>
+            ) : (
+              <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                      Interactive Screenshot Walkthrough &amp; Editable 2027 Proposal
+                    </h3>
+                    <p className="mt-1 text-xs text-slate-600 dark:text-slate-400 tabular-nums">
+                      {screenshots.length}/6 screenshots ready ·{' '}
+                      {briefValid ? 'Client brief complete' : 'Complete client name, type & brief in Step 1'}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handlePreviewSampleTour}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap"
+                    >
+                      <Play className="h-3.5 w-3.5" />
+                      Load Sample Tour
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleGenerate()}
+                      disabled={isGenerating || !screenshotCountValid || !briefValid}
+                      style={{ backgroundColor: project.brandColor, color: brandContrast }}
+                      className="inline-flex items-center gap-2 rounded-lg px-4 py-2 text-xs font-semibold transition-opacity hover:opacity-95 disabled:opacity-45 whitespace-nowrap"
+                    >
+                      {isGenerating ? (
+                        <>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          <span>{generationStage || 'Generating walkthrough...'}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="h-3.5 w-3.5" />
+                          <span>Generate Walkthrough &amp; Proposal</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+                {errorMessage && (
+                  <p className="mt-3 text-xs text-rose-700 dark:text-rose-400 whitespace-pre-line">
+                    {errorMessage}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Step Navigation Footer */}
+        <div className="no-print flex items-center justify-between border-t border-slate-200 pt-6 dark:border-slate-800">
+          {activeStep > 1 ? (
+            <button
+              type="button"
+              onClick={() => navigateToStep((activeStep - 1) as PipelineStep)}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              <span>Previous: Step {activeStep - 1}</span>
+            </button>
+          ) : (
+            <span />
+          )}
+
+          {activeStep < 4 && (
+            <button
+              type="button"
+              onClick={() => navigateToStep((activeStep + 1) as PipelineStep)}
+              style={{ backgroundColor: project.brandColor, color: brandContrast }}
+              className="inline-flex items-center gap-2 rounded-lg px-4 py-2 text-xs font-semibold transition-opacity hover:opacity-95"
+            >
+              <span>
+                Next: {pipelineSteps[activeStep].title}
+              </span>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+
+        {/* Printable Scorecard + Proposal Layer (Always Mounted for Any-Step Print) */}
         {showPrintableLayer && (
           <PrintProposalView
             project={project}
@@ -743,12 +1098,13 @@ export default function App() {
             scorecard={scorecard}
             auditedUrl={project.websiteUrl || ''}
             printMode={printMode}
+            siteAnalysisReport={siteAnalysisReport}
           />
         )}
       </main>
 
       <footer className="no-print border-t border-slate-200 py-6 text-center text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
-        TourForge Lite · Evidence-based website audits, walkthroughs, and 2027 proposals
+        TourForge Lite · Open-source website audits, AI visibility checks, GBP benchmarks, and 2027 proposals
       </footer>
 
       <SettingsModal

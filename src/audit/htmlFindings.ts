@@ -2,6 +2,7 @@ import * as cheerio from 'cheerio';
 import {
   AuditFinding,
   AuditNote,
+  JsonLdEntityDetails,
   ParsedHtmlFacts,
   ParsedLinks,
   SpeedMetrics,
@@ -178,24 +179,48 @@ export function deriveClientName(options: {
   return options.defaultLabel ?? 'Client Website';
 }
 
-function collectJsonLdTypes(node: unknown, out: Set<string>): void {
+function collectJsonLdTypesAndDetails(
+  node: unknown,
+  outTypes: Set<string>,
+  details: JsonLdEntityDetails
+): void {
   if (!node || typeof node !== 'object') return;
   if (Array.isArray(node)) {
-    for (const item of node) collectJsonLdTypes(item, out);
+    for (const item of node) collectJsonLdTypesAndDetails(item, outTypes, details);
     return;
   }
   const obj = node as Record<string, unknown>;
   const rawType = obj['@type'];
-  if (typeof rawType === 'string' && rawType.trim()) {
-    out.add(rawType.trim());
+  const checkType = (t: string) => {
+    const trimmed = t.trim();
+    if (!trimmed) return;
+    outTypes.add(trimmed);
+    if (trimmed === 'FAQPage' || trimmed === 'QAPage') {
+      details.hasFaqPage = true;
+    }
+  };
+  if (typeof rawType === 'string') {
+    checkType(rawType);
   } else if (Array.isArray(rawType)) {
     for (const t of rawType) {
-      if (typeof t === 'string' && t.trim()) out.add(t.trim());
+      if (typeof t === 'string') checkType(t);
     }
   }
+
+  if (obj.address) details.hasAddress = true;
+  if (obj.telephone || obj.phone) details.hasTelephone = true;
+  if (obj.openingHours || obj.openingHoursSpecification) details.hasOpeningHours = true;
+  if (obj.priceRange) details.hasPriceRange = true;
+  if (obj.sameAs && (!Array.isArray(obj.sameAs) || obj.sameAs.length > 0)) {
+    details.hasSameAs = true;
+  }
+  if (obj.geo || (obj.latitude !== undefined && obj.longitude !== undefined)) {
+    details.hasGeo = true;
+  }
+
   for (const val of Object.values(obj)) {
     if (val && typeof val === 'object') {
-      collectJsonLdTypes(val, out);
+      collectJsonLdTypesAndDetails(val, outTypes, details);
     }
   }
 }
@@ -244,13 +269,22 @@ export function parseHtmlWithCheerio(html: string): ParsedHtmlFacts {
   });
 
   const jsonLdTypesSet = new Set<string>();
+  const jsonLdDetails: JsonLdEntityDetails = {
+    hasAddress: false,
+    hasTelephone: false,
+    hasOpeningHours: false,
+    hasPriceRange: false,
+    hasSameAs: false,
+    hasFaqPage: false,
+    hasGeo: false,
+  };
   let jsonLdInvalidCount = 0;
   $('script[type="application/ld+json"]').each((_, el) => {
     const raw = $(el).html() || $(el).text() || '';
     if (!raw.trim()) return;
     try {
       const parsed = JSON.parse(raw);
-      collectJsonLdTypes(parsed, jsonLdTypesSet);
+      collectJsonLdTypesAndDetails(parsed, jsonLdTypesSet, jsonLdDetails);
     } catch {
       jsonLdInvalidCount++;
     }
@@ -373,6 +407,7 @@ export function parseHtmlWithCheerio(html: string): ParsedHtmlFacts {
     imagesMissingAlt,
     jsonLdTypes: Array.from(jsonLdTypesSet),
     jsonLdInvalidCount,
+    jsonLdDetails,
     links,
     formCount,
     ctaTexts: ctaTexts.slice(0, 16),

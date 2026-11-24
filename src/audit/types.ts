@@ -79,6 +79,17 @@ export const ParsedLinksSchema = z.object({
 });
 export type ParsedLinks = z.infer<typeof ParsedLinksSchema>;
 
+export const JsonLdEntityDetailsSchema = z.object({
+  hasAddress: z.boolean(),
+  hasTelephone: z.boolean(),
+  hasOpeningHours: z.boolean(),
+  hasPriceRange: z.boolean(),
+  hasSameAs: z.boolean(),
+  hasFaqPage: z.boolean(),
+  hasGeo: z.boolean(),
+});
+export type JsonLdEntityDetails = z.infer<typeof JsonLdEntityDetailsSchema>;
+
 export const ParsedHtmlFactsSchema = z.object({
   title: z.string(),
   titleLength: z.number(),
@@ -98,11 +109,45 @@ export const ParsedHtmlFactsSchema = z.object({
   imagesMissingAlt: z.number(),
   jsonLdTypes: z.array(z.string()),
   jsonLdInvalidCount: z.number(),
+  jsonLdDetails: JsonLdEntityDetailsSchema.optional(),
   links: ParsedLinksSchema,
   formCount: z.number(),
   ctaTexts: z.array(z.string()),
 });
 export type ParsedHtmlFacts = z.infer<typeof ParsedHtmlFactsSchema>;
+
+export const AiBotAccessStatusSchema = z.enum(['allowed', 'blocked', 'unknown']);
+export type AiBotAccessStatus = z.infer<typeof AiBotAccessStatusSchema>;
+
+export const AiBotPermissionSchema = z.object({
+  bot: z.string(),
+  label: z.string(),
+  status: AiBotAccessStatusSchema,
+});
+export type AiBotPermission = z.infer<typeof AiBotPermissionSchema>;
+
+export const AiReadinessSchema = z.object({
+  robotsChecked: z.boolean().nullable(),
+  botAccess: z.array(AiBotPermissionSchema),
+  llmsTxt: z.object({
+    exists: z.boolean().nullable(),
+    url: z.string().nullable().optional(),
+    bytes: z.number().nullable().optional(),
+    preview: z.string().nullable().optional(),
+    reason: z.string().optional(),
+  }),
+  entityCompleteness: z.object({
+    hasBusinessType: z.boolean(),
+    hasAddress: z.boolean(),
+    hasTelephone: z.boolean(),
+    hasOpeningHours: z.boolean(),
+    hasPriceRange: z.boolean(),
+    hasSameAs: z.boolean(),
+    hasFaqPage: z.boolean(),
+    hasGeo: z.boolean(),
+  }),
+});
+export type AiReadinessResult = z.infer<typeof AiReadinessSchema>;
 
 export const AuditNoteSchema = z.object({
   code: z.string(),
@@ -127,6 +172,7 @@ export const AuditResultSchema = z.object({
   contentSource: ContentSourceSchema.optional(),
   auditNotes: z.array(AuditNoteSchema).optional(),
   redirectedFromHost: z.string().optional(),
+  aiReadiness: AiReadinessSchema.optional(),
   parsed: ParsedHtmlFactsSchema.nullable(),
   robotsTxt: z.object({
     exists: z.boolean().nullable(),
@@ -156,6 +202,17 @@ export const ListingRowSchema = z.object({
   seenPhone: z.string().default(''),
 });
 export type ListingRow = z.infer<typeof ListingRowSchema>;
+
+export const CompetitorBenchmarkRowSchema = z.object({
+  id: z.string(),
+  name: z.string().default(''),
+  category: z.string().default(''),
+  reviewCount: z.number().nullable().default(null),
+  averageRating: z.number().nullable().default(null),
+  photoCount: z.number().nullable().default(null),
+  postsLast90Days: z.number().nullable().default(null),
+});
+export type CompetitorBenchmarkRow = z.infer<typeof CompetitorBenchmarkRowSchema>;
 
 export const ManualFootprintSchema = z.object({
   nap: z
@@ -219,6 +276,7 @@ export const ManualFootprintSchema = z.object({
       followers: null,
     }),
   listings: z.array(ListingRowSchema).default([]),
+  competitors: z.array(CompetitorBenchmarkRowSchema).optional().default([]),
   openingHoursText: z.string().optional().default(''),
   priceRange: z.string().optional().default(''),
 });
@@ -271,6 +329,7 @@ export function createEmptyManualFootprint(): ManualFootprint {
       seenAddress: '',
       seenPhone: '',
     })),
+    competitors: [],
     openingHoursText: '',
     priceRange: '',
   };
@@ -363,3 +422,37 @@ export const ProspectEntrySchema = z.object({
   scorecard: ScorecardSchema.nullable(),
 });
 export type ProspectEntry = z.infer<typeof ProspectEntrySchema>;
+
+export const AiMentionCheckItemSchema = z.object({
+  query: z.string(),
+  clientMentioned: z.boolean(),
+  citedDomain: z.boolean(),
+  competitorsMentioned: z.array(z.string()).default([]),
+  summary: z.string(),
+});
+export type AiMentionCheckItem = z.infer<typeof AiMentionCheckItemSchema>;
+
+export const AiMentionCheckResultSchema = z.object({
+  checkedAt: z.string(),
+  modelId: z.string(),
+  searchCapable: z.boolean(),
+  searchCaveat: z.string(),
+  overallVisibility: z.enum(['visible', 'partial', 'not-mentioned']),
+  results: z.array(AiMentionCheckItemSchema),
+});
+export type AiMentionCheckResult = z.infer<typeof AiMentionCheckResultSchema>;
+
+export const SiteAnalysisReportSchema = z.object({
+  generatedAt: z.string(),
+  modelId: z.string(),
+  providerLabel: z.string(),
+  executiveSummary: z.string(),
+  biggestRevenueLeaks: z.array(z.string()).min(1),
+  aiVisibilityVerdict: z.string(),
+  gbpActionSummary: z.string(),
+  quickWins30Days: z.array(z.string()).min(1),
+  strategic90Days: z.array(z.string()).min(1),
+  clientPitchAngle: z.string(),
+  needsReview: z.boolean().optional(),
+});
+export type SiteAnalysisReport = z.infer<typeof SiteAnalysisReportSchema>;

@@ -1,4 +1,5 @@
 import React from 'react';
+import { buildAiReadinessSummary } from '../audit/aiReadiness';
 import { deriveClientName } from '../audit/htmlFindings';
 import { getRagLabel } from '../audit/scorecard';
 import { AuditResult, Scorecard } from '../audit/types';
@@ -33,6 +34,7 @@ export const PrintScorecardView: React.FC<PrintScorecardViewProps> = ({
     defaultLabel: 'Website Audit Prospect',
   });
   const isProvisional = scorecard.isProvisional ?? scorecard.dataCompletenessPct < 70;
+  const aiSummary = buildAiReadinessSummary(audit);
   const displayUrl = audit?.finalUrl || auditedUrl || audit?.requestedUrl || 'Manual & Website Audit';
   const auditDate = audit?.auditedAt
     ? new Date(audit.auditedAt).toLocaleDateString()
@@ -244,6 +246,11 @@ export const PrintScorecardView: React.FC<PrintScorecardViewProps> = ({
               {audit?.ttfbMs !== null && audit?.ttfbMs !== undefined
                 ? ` · Median TTFB: ${audit.ttfbMs} ms`
                 : ''}
+            </p>
+          )}
+          {aiSummary.score !== null && (
+            <p className="mt-1 border-t border-slate-100 pt-1 text-[9px] font-medium text-slate-600 tabular-nums">
+              AI Search Readiness: {aiSummary.score}/100 ({aiSummary.allowedBotsCount}/{aiSummary.totalBotsCount} bots · {aiSummary.entityFieldsPresent}/8 schema)
             </p>
           )}
         </div>

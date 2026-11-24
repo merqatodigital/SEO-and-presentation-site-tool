@@ -1,6 +1,18 @@
 import { z } from 'zod';
-import { AuditFinding } from '../audit/types';
+import { buildAiReadinessSummary } from '../audit/aiReadiness';
+import { computeGbpCompetitorBenchmark } from '../audit/gbpPlaybook';
 import {
+  AiMentionCheckResult,
+  AiMentionCheckResultSchema,
+  AuditFinding,
+  AuditResult,
+  ManualFootprint,
+  Scorecard,
+  SiteAnalysisReport,
+  SiteAnalysisReportSchema,
+} from '../audit/types';
+import {
+  AISearchLayerData,
   AISettings,
   PageFacts,
   ProjectBrief,
@@ -192,6 +204,13 @@ export interface ModelOption {
   pricingLabel: string;
 }
 
+export interface OllamaDetectionResult {
+  reachable: boolean;
+  baseUrl: string;
+  models: ModelOption[];
+  error?: string;
+}
+
 interface RawModelEntry {
   id?: string;
   name?: string;
@@ -205,6 +224,141 @@ interface RawModelEntry {
   };
 }
 
+interface RawOllamaTagEntry {
+  name?: string;
+  model?: string;
+  size?: number;
+  details?: {
+    family?: string;
+    families?: string[] | null;
+    parameter_size?: string;
+    quantization_level?: string;
+  };
+}
+
+export const OLLAMA_DEFAULT_BASE_URL = 'http://127.0.0.1:11434/v1';
+
+export function isOllamaBaseUrl(baseUrl: string): boolean {
+  return /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):11434(?:\/|$)/i.test(baseUrl.trim());
+}
+
+export function getEffectiveAnalysisModel(settings: AISettings): string {
+  return settings.analysisModel?.trim() || settings.model.trim();
+}
+
+export function getProviderLabel(settings: AISettings): string {
+  if (isOllamaBaseUrl(settings.baseUrl)) return 'Local Ollama';
+  if (/integrate\.api\.nvidia\.com/i.test(settings.baseUrl)) return 'NVIDIA NIM';
+  if (/openrouter\.ai/i.test(settings.baseUrl)) {
+    const model = getEffectiveAnalysisModel(settings);
+    return /:free$/i.test(model) || settings.providerPreset === 'openrouter-free'
+      ? 'OpenRouter Free'
+      : 'OpenRouter';
+  }
+  return 'Custom OpenAI-Compatible';
+}
+
+function inferOllamaSupportsVision(id: string, families?: string[] | null): boolean {
+  const familyStr = Array.isArray(families) ? families.join(' ').toLowerCase() : '';
+  return (
+    /(?:vision|llava|minicpm-v|qwen2\.5vl|qwen2-vl|qwen3-vl|llama3\.2-vision|gemma3|bakllava|moondream|pixtral|-vl\b|mllama)/i.test(
+      id
+    ) || /(?:clip|mllama|vision|vl)/i.test(familyStr)
+  );
+}
+
+function formatBytesToGb(bytes?: number): string {
+  if (!bytes || !Number.isFinite(bytes) || bytes <= 0) return '';
+  const gb = bytes / (1024 * 1024 * 1024);
+  if (gb >= 1) return `${gb.toFixed(1)} GB`;
+  return `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+
+function parseOllamaTagsToModels(rawModels: RawOllamaTagEntry[]): ModelOption[] {
+  return rawModels
+    .map((entry): ModelOption | null => {
+      const id = (entry.model || entry.name || '').trim();
+      if (!id) return null;
+      const paramSize = entry.details?.parameter_size?.trim();
+      const sizeStr = paramSize || formatBytesToGb(entry.size);
+      const supportsVision = inferOllamaSupportsVision(id, entry.details?.families);
+      return {
+        id,
+        name: id,
+        tier: 'free',
+        supportsVision,
+        pricingLabel: sizeStr ? `Local · ${sizeStr}` : 'Local · Free',
+      };
+    })
+    .filter((m): m is ModelOption => Boolean(m))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export async function detectLocalOllama(captureToken = ''): Promise<OllamaDetectionResult> {
+  const tryParseTags = async (res: Response): Promise<ModelOption[]> => {
+    const text = await res.text();
+    const parsed = JSON.parse(text) as { models?: RawOllamaTagEntry[] };
+    return Array.isArray(parsed.models) ? parseOllamaTagsToModels(parsed.models) : [];
+  };
+
+  // 1. Try direct localhost Ollama HTTP endpoint (fast 1.8s probe)
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1800);
+  try {
+    const directRes = await fetch('http://127.0.0.1:11434/api/tags', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (directRes.ok) {
+      const models = await tryParseTags(directRes);
+      return {
+        reachable: true,
+        baseUrl: OLLAMA_DEFAULT_BASE_URL,
+        models,
+      };
+    }
+  } catch {
+    // Fallback to server-side local Ollama bridge
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // 2. Try server-side local Ollama bridge (/api/ollama/tags)
+  try {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (captureToken.trim()) {
+      headers.Authorization = `Bearer ${captureToken.trim()}`;
+    }
+    const bridgeRes = await fetch('/api/ollama/tags', {
+      method: 'GET',
+      headers,
+    });
+    if (bridgeRes.ok) {
+      const models = await tryParseTags(bridgeRes);
+      return {
+        reachable: true,
+        baseUrl: OLLAMA_DEFAULT_BASE_URL,
+        models,
+      };
+    }
+    const errText = await bridgeRes.text().catch(() => '');
+    return {
+      reachable: false,
+      baseUrl: OLLAMA_DEFAULT_BASE_URL,
+      models: [],
+      error: errText || `Local Ollama not detected (HTTP ${bridgeRes.status}).`,
+    };
+  } catch {
+    return {
+      reachable: false,
+      baseUrl: OLLAMA_DEFAULT_BASE_URL,
+      models: [],
+      error: 'Local Ollama service was not detected on port 11434.',
+    };
+  }
+}
+
 async function fetchWithCorsFallback(
   url: string,
   method: 'GET' | 'POST',
@@ -212,13 +366,14 @@ async function fetchWithCorsFallback(
   body?: unknown,
   captureToken = ''
 ): Promise<Response> {
+  const isOllama = isOllamaBaseUrl(url);
   const headers: Record<string, string> = {
     Accept: 'application/json',
   };
   if (method === 'POST') {
     headers['Content-Type'] = 'application/json';
   }
-  if (apiKey.trim()) {
+  if (!isOllama && apiKey.trim()) {
     headers.Authorization = `Bearer ${apiKey.trim()}`;
   }
 
@@ -229,15 +384,32 @@ async function fetchWithCorsFallback(
       body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
     });
   } catch (directErr) {
+    const bridgeHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (captureToken.trim()) {
+      bridgeHeaders.Authorization = `Bearer ${captureToken.trim()}`;
+    }
+
+    if (isOllama) {
+      if (method === 'GET') {
+        return await fetch('/api/ollama/tags', {
+          method: 'GET',
+          headers: bridgeHeaders,
+        });
+      }
+      return await fetch('/api/ollama/chat', {
+        method: 'POST',
+        headers: bridgeHeaders,
+        body: JSON.stringify(body ?? {}),
+      });
+    }
+
     // Relay external HTTPS endpoints (e.g. NVIDIA NIM) if browser CORS blocks direct fetch
     if (/^https:\/\//i.test(url)) {
-      const relayHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (captureToken.trim()) {
-        relayHeaders.Authorization = `Bearer ${captureToken.trim()}`;
-      }
       return await fetch('/api/relay', {
         method: 'POST',
-        headers: relayHeaders,
+        headers: bridgeHeaders,
         body: JSON.stringify({
           url,
           method,
@@ -260,13 +432,34 @@ export async function fetchAvailableModels(
     throw new Error('Enter a Base URL before refreshing models.');
   }
 
+  if (isOllamaBaseUrl(cleanBase)) {
+    const detected = await detectLocalOllama(captureToken);
+    if (!detected.reachable) {
+      throw new Error(
+        detected.error ||
+          'Local Ollama is not running on port 11434. Start Ollama locally to list installed models.'
+      );
+    }
+    if (detected.models.length === 0) {
+      throw new Error(
+        'Ollama is running, but no models are installed yet. Run e.g. "ollama pull qwen2.5:7b" or "ollama pull llama3.2-vision".'
+      );
+    }
+    return detected.models;
+  }
+
   const url = `${cleanBase}/models`;
   const response = await fetchWithCorsFallback(url, 'GET', apiKey, undefined, captureToken);
   const text = await response.text();
 
-  let parsed: { data?: RawModelEntry[]; error?: { message?: string } } | null = null;
+  let parsed: { data?: RawModelEntry[]; models?: RawOllamaTagEntry[]; error?: { message?: string } } | null =
+    null;
   try {
-    parsed = JSON.parse(text) as { data?: RawModelEntry[]; error?: { message?: string } };
+    parsed = JSON.parse(text) as {
+      data?: RawModelEntry[];
+      models?: RawOllamaTagEntry[];
+      error?: { message?: string };
+    };
   } catch {
     parsed = null;
   }
@@ -274,6 +467,10 @@ export async function fetchAvailableModels(
   if (!response.ok) {
     const errMsg = parsed?.error?.message || text || response.statusText;
     throw new Error(`Could not fetch models (${response.status}): ${errMsg}`);
+  }
+
+  if (Array.isArray(parsed?.models) && parsed.models.length > 0 && !Array.isArray(parsed?.data)) {
+    return parseOllamaTagsToModels(parsed.models);
   }
 
   const rawList = Array.isArray(parsed?.data) ? parsed.data : [];
@@ -334,17 +531,21 @@ export async function fetchAvailableModels(
 async function callChatCompletions(
   settings: AISettings,
   messages: ChatMessage[],
-  maxTokens = 2400
+  maxTokens = 2400,
+  modelOverride?: string,
+  temperature = 0.35
 ): Promise<string> {
-  const url = `${normalizeBaseUrl(settings.baseUrl)}/chat/completions`;
+  const cleanBase = normalizeBaseUrl(settings.baseUrl);
+  const url = `${cleanBase}/chat/completions`;
+  const targetModel = (modelOverride ?? settings.model).trim();
 
   const response = await fetchWithCorsFallback(
     url,
     'POST',
     settings.apiKey,
     {
-      model: settings.model.trim(),
-      temperature: 0.35,
+      model: targetModel,
+      temperature,
       max_tokens: maxTokens,
       messages,
     },
@@ -363,7 +564,7 @@ async function callChatCompletions(
     const serverMessage = parsed?.error?.message || text || response.statusText;
     if (/image input|does not support image|image_url|multimodal/i.test(serverMessage)) {
       throw new Error(
-        `Model "${settings.model.trim()}" does not support image inputs (${serverMessage}). Open Settings, keep "Vision capable only" checked, and choose a Vision model.`
+        `Model "${targetModel}" does not support image inputs (${serverMessage}). Open Settings and choose a Vision model for Walkthrough generation.`
       );
     }
     throw new Error(`Provider returned ${response.status}: ${serverMessage}`);
@@ -381,26 +582,32 @@ async function callChatCompletions(
   return content;
 }
 
-export async function testAIConnection(settings: AISettings): Promise<{ ok: boolean; message: string }> {
+export async function testAIConnection(
+  settings: AISettings,
+  modelOverride?: string
+): Promise<{ ok: boolean; message: string }> {
   if (!settings.baseUrl.trim()) {
     return { ok: false, message: 'Enter a Base URL before testing.' };
   }
-  if (!settings.apiKey.trim()) {
+  const isLocalOllama = isOllamaBaseUrl(settings.baseUrl);
+  if (!isLocalOllama && !settings.apiKey.trim()) {
     return { ok: false, message: 'Enter an API key before testing.' };
   }
-  if (!settings.model.trim()) {
-    return { ok: false, message: 'Enter a model name before testing.' };
+  const targetModel = (modelOverride ?? settings.model).trim();
+  if (!targetModel) {
+    return { ok: false, message: 'Select or enter a model name before testing.' };
   }
 
   try {
     const reply = await callChatCompletions(
       settings,
       [{ role: 'user', content: 'Reply with exactly: OK' }],
-      16
+      16,
+      targetModel
     );
     return {
       ok: true,
-      message: `Connected cleanly to ${settings.model.trim()} (received: "${reply.trim().slice(0, 40)}").`,
+      message: `Connected cleanly to ${targetModel} (received: "${reply.trim().slice(0, 40)}").`,
     };
   } catch (err) {
     return {
@@ -655,4 +862,440 @@ export async function generateWalkthrough({
   throw new Error(
     `Could not validate model output after retry.\n${secondAttempt.errorText ?? ''}`
   );
+}
+
+// ---------------------------------------------------------------------------
+// Live AI Brand Mention Check (ChatGPT / OpenRouter / NIM / Ollama)
+// ---------------------------------------------------------------------------
+
+const MentionResponseSchema = z.object({
+  results: z
+    .array(
+      z.object({
+        query: z.string().min(1),
+        clientMentioned: z.boolean(),
+        citedDomain: z.boolean(),
+        competitorsMentioned: z.array(z.string()).default([]),
+        summary: z.string().min(1),
+      })
+    )
+    .min(1),
+});
+
+export interface RunAiBrandMentionCheckOptions {
+  settings: AISettings;
+  project: ProjectBrief;
+  audit: AuditResult | null;
+  aiSearchLayer: AISearchLayerData;
+  completeChat?: (messages: Array<{ role: string; content: string }>) => Promise<string>;
+}
+
+export function buildBuyerDiscoveryQueries(
+  project: ProjectBrief,
+  aiSearchLayer: AISearchLayerData
+): string[] {
+  const businessType = project.businessType.trim() || 'local business';
+  const rawArea = aiSearchLayer.serviceArea.trim();
+  const location =
+    rawArea && rawArea.toLowerCase() !== 'local & surrounding service area'
+      ? rawArea
+      : 'local area';
+
+  return [
+    `Best ${businessType} in ${location} — who should I book with and why?`,
+    `Top-rated ${businessType} near ${location} for direct booking without extra middleman fees`,
+    `Compare trusted ${businessType} options in ${location} (services, contact, booking)`,
+  ];
+}
+
+export async function runAiBrandMentionCheck({
+  settings,
+  project,
+  audit,
+  aiSearchLayer,
+  completeChat,
+}: RunAiBrandMentionCheckOptions): Promise<AiMentionCheckResult> {
+  const modelId = getEffectiveAnalysisModel(settings);
+  if (!modelId) {
+    throw new Error('Choose an AI model in Settings before running the Brand Mention Check.');
+  }
+
+  const clientName = project.clientName.trim() || 'Client Business';
+  const targetUrl = audit?.finalUrl || project.websiteUrl || aiSearchLayer.websiteUrl || '';
+  let targetDomain = '';
+  if (targetUrl) {
+    try {
+      targetDomain = new URL(/^https?:\/\//i.test(targetUrl) ? targetUrl : `https://${targetUrl}`).hostname;
+    } catch {
+      targetDomain = targetUrl;
+    }
+  }
+
+  const queries = buildBuyerDiscoveryQueries(project, aiSearchLayer);
+  const searchCapable = /:online\b|\bsonar\b/i.test(modelId);
+  const searchCaveat = searchCapable
+    ? `Live web search is enabled via ${modelId}; citations reflect current web index results.`
+    : `Model "${modelId}" uses training memory without live web browsing. Switch to an OpenRouter ":online" or Perplexity Sonar model in Settings for real-time web citations.`;
+
+  const messages: ChatMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You evaluate whether an AI assistant currently recognizes and recommends a specific local business when answering buyer discovery queries. Do NOT pretend to recommend the client if you would not naturally recall or see them; be completely honest. Return ONLY valid JSON matching the schema.',
+    },
+    {
+      role: 'user',
+      content: [
+        `Target business to check for: "${clientName}"${targetDomain ? ` (domain: ${targetDomain})` : ''}`,
+        `Category: ${project.businessType.trim() || 'Local business'}`,
+        `Area: ${aiSearchLayer.serviceArea.trim() || 'Local area'}`,
+        '',
+        'Evaluate these 3 buyer queries as a customer asking an AI assistant today:',
+        ...queries.map((q, idx) => `${idx + 1}. ${q}`),
+        '',
+        'For each query, report honestly:',
+        '- clientMentioned (boolean: would you confidently name this business without being prompted by the user?)',
+        '- citedDomain (boolean: would you include or verify their official domain?)',
+        '- competitorsMentioned (string[]: up to 4 competitor or OTA platform names you would typically mention for that query)',
+        '- summary (string: 1-2 plain sentences summarizing what a buyer sees and why the client was or was not recommended)',
+        '',
+        'Return ONLY raw JSON (no markdown fences):',
+        '{ "results": [{ "query": string, "clientMentioned": boolean, "citedDomain": boolean, "competitorsMentioned": string[], "summary": string }] }',
+      ].join('\n'),
+    },
+  ];
+
+  const raw = completeChat
+    ? await completeChat(messages.map((m) => ({ role: m.role, content: String(m.content) })))
+    : await callChatCompletions(settings, messages, 1400, modelId, 0.25);
+
+  const parsedJson = JSON.parse(stripJsonFences(raw)) as unknown;
+  const validated = MentionResponseSchema.safeParse(parsedJson);
+  if (!validated.success) {
+    throw new Error(`Invalid AI Mention Check JSON:\n${formatZodIssues(validated.error)}`);
+  }
+
+  const results = validated.data.results.slice(0, 3);
+  const mentionedCount = results.filter((r) => r.clientMentioned).length;
+  const overallVisibility: AiMentionCheckResult['overallVisibility'] =
+    mentionedCount >= 2 ? 'visible' : mentionedCount === 1 ? 'partial' : 'not-mentioned';
+
+  const normalized = AiMentionCheckResultSchema.parse({
+    checkedAt: new Date().toISOString(),
+    modelId,
+    searchCapable,
+    searchCaveat,
+    overallVisibility,
+    results,
+  });
+
+  return normalized;
+}
+
+// ---------------------------------------------------------------------------
+// AI Site Analysis Agent (Executive Report Grounded in Measured Audit Facts)
+// ---------------------------------------------------------------------------
+
+const SiteReportPayloadSchema = SiteAnalysisReportSchema.omit({
+  generatedAt: true,
+  modelId: true,
+  providerLabel: true,
+  needsReview: true,
+});
+
+export function validateReportNumbersGrounded(
+  report: z.infer<typeof SiteReportPayloadSchema>,
+  allowedText: string
+): { valid: boolean; violations: string[] } {
+  const normalizedAllowed = normalizeForNumberMatch(allowedText || '');
+  const violations: string[] = [];
+
+  const isTokenGrounded = (rawToken: string): boolean => {
+    const compact = rawToken.toLowerCase().replace(/,/g, '').replace(/\s+/g, '');
+    if (!compact) return true;
+    if (compact === '2027' || compact === '30' || compact === '90' || compact === '100') {
+      return true;
+    }
+    const matcher = new RegExp(`(?:^|[^0-9.])${escapeRegExp(compact)}(?![0-9.%])`, 'i');
+    return matcher.test(normalizedAllowed);
+  };
+
+  const scan = (text: string) => {
+    const withoutQuarters = text.replace(QUARTER_LABEL_REGEX, ' ');
+    const matches = withoutQuarters.match(NUMERIC_TOKEN_REGEX);
+    if (!matches) return;
+    for (const token of matches) {
+      if (!isTokenGrounded(token)) {
+        violations.push(token.trim());
+      }
+    }
+  };
+
+  scan(report.executiveSummary);
+  report.biggestRevenueLeaks.forEach(scan);
+  scan(report.aiVisibilityVerdict);
+  scan(report.gbpActionSummary);
+  report.quickWins30Days.forEach(scan);
+  report.strategic90Days.forEach(scan);
+  scan(report.clientPitchAngle);
+
+  return {
+    valid: violations.length === 0,
+    violations: Array.from(new Set(violations)),
+  };
+}
+
+export interface RunSiteAnalysisAgentOptions {
+  settings: AISettings;
+  project: ProjectBrief;
+  audit: AuditResult | null;
+  scorecard: Scorecard;
+  manualFootprint: ManualFootprint;
+  aiSearchLayer: AISearchLayerData;
+  aiMentionCheck?: AiMentionCheckResult | null;
+  pageFacts?: PageFacts | null;
+  onStage?: (stage: string) => void;
+  completeChat?: (messages: Array<{ role: string; content: string }>) => Promise<string>;
+}
+
+export async function runSiteAnalysisAgent({
+  settings,
+  project,
+  audit,
+  scorecard,
+  manualFootprint,
+  aiSearchLayer,
+  aiMentionCheck,
+  pageFacts,
+  onStage,
+  completeChat,
+}: RunSiteAnalysisAgentOptions): Promise<SiteAnalysisReport> {
+  const modelId = getEffectiveAnalysisModel(settings);
+  if (!modelId) {
+    throw new Error('Select an AI Analysis model (OpenRouter Free/Paid, NIM, or Local Ollama) in Settings first.');
+  }
+
+  const clientName =
+    manualFootprint.nap.businessName.trim() ||
+    project.clientName.trim() ||
+    audit?.parsed?.ogSiteName ||
+    'Client Business';
+
+  const aiReadinessSummary = buildAiReadinessSummary(audit);
+  const gbpBenchmark = computeGbpCompetitorBenchmark(manualFootprint, clientName);
+
+  const nonPassFindings = scorecard.allFindings
+    .filter((f) => f.status === 'fail' || f.status === 'warn')
+    .slice(0, 12);
+
+  const groundTruthPayload = {
+    clientName,
+    businessType: project.businessType.trim() || 'Local Business',
+    websiteUrl: audit?.finalUrl || project.websiteUrl || aiSearchLayer.websiteUrl || '',
+    brief: project.brief.trim(),
+    scorecard: {
+      overallScore: scorecard.overallScore,
+      grade: scorecard.grade,
+      dataCompletenessPct: scorecard.dataCompletenessPct,
+      isProvisional: scorecard.isProvisional,
+      categories: scorecard.categories.map((c) => ({
+        label: c.label,
+        score: c.score,
+        insufficientData: c.insufficientData,
+        knownCount: c.knownCount,
+        totalCount: c.totalCount,
+      })),
+    },
+    topFindings: nonPassFindings.map((f) => ({
+      id: f.id,
+      label: f.label,
+      status: f.status,
+      evidence: f.evidence,
+      fix: f.fix,
+      businessImpact: f.businessImpact,
+    })),
+    aiReadiness: {
+      score: aiReadinessSummary.score,
+      allowedBotsCount: aiReadinessSummary.allowedBotsCount,
+      blockedBotsCount: aiReadinessSummary.blockedBotsCount,
+      totalBotsCount: aiReadinessSummary.totalBotsCount,
+      llmsStatus: aiReadinessSummary.llmsStatus,
+      entityFieldsPresent: aiReadinessSummary.entityFieldsPresent,
+      entityFieldsTotal: aiReadinessSummary.entityFieldsTotal,
+      items: aiReadinessSummary.items.map((i) => ({
+        label: i.label,
+        status: i.status,
+        detail: i.detail,
+      })),
+    },
+    aiMentionCheck: aiMentionCheck
+      ? {
+          overallVisibility: aiMentionCheck.overallVisibility,
+          results: aiMentionCheck.results.map((r) => ({
+            query: r.query,
+            clientMentioned: r.clientMentioned,
+            citedDomain: r.citedDomain,
+          })),
+        }
+      : null,
+    gbpAndCompetitors: {
+      clientReviews: manualFootprint.gbp.reviewCount,
+      clientRating: manualFootprint.gbp.averageRating,
+      clientPhotos: manualFootprint.gbp.photoCount,
+      clientPosts90d: manualFootprint.gbp.postsLast90Days,
+      competitorSummary: gbpBenchmark.summaryLine,
+      topCompetitorName: gbpBenchmark.topCompetitorName,
+      topCompetitorReviews: gbpBenchmark.topCompetitorReviews,
+      reviewGapToLeader: gbpBenchmark.reviewGapToLeader,
+      avgCompetitorPhotos: gbpBenchmark.avgCompetitorPhotos,
+    },
+    ignoredLeads: scorecard.ignoredLeads.visible
+      ? {
+          inquiriesLostRange: `${scorecard.ignoredLeads.inquiriesLostLow}-${scorecard.ignoredLeads.inquiriesLostHigh}`,
+          effectiveLossPct: scorecard.ignoredLeads.effectiveLossPct,
+        }
+      : null,
+  };
+
+  const allowedNumberText = [
+    JSON.stringify(groundTruthPayload),
+    ...scorecard.allFindings.map((f) => `${f.label}: ${f.evidence}`),
+    pageFacts?.title || '',
+    pageFacts?.description || '',
+    ...(pageFacts?.headings || []),
+    ...(pageFacts?.ctas || []),
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const messages: ChatMessage[] = [
+    {
+      role: 'system',
+      content: [
+        'You are a senior digital agency strategist preparing an internal audit briefing and client pitch summary.',
+        'Ground every statement strictly in the measured JSON evidence provided.',
+        'NEVER invent numbers, percentages, review counts, traffic estimates, or rankings not explicitly present in the provided JSON (you may reference 30-day and 90-day phases or 2027).',
+        'Write crisp, specific, business-outcome prose — zero fluff. Return ONLY valid JSON matching the schema.',
+      ].join(' '),
+    },
+    {
+      role: 'user',
+      content: [
+        'Measured Client Audit & Visibility Evidence:',
+        JSON.stringify(groundTruthPayload, null, 2),
+        '',
+        'Produce an agency analysis report as ONLY raw JSON (no markdown fences) with these exact fields:',
+        '{',
+        '  "executiveSummary": string (3-4 crisp sentences summarizing overall digital health and opportunity),',
+        '  "biggestRevenueLeaks": string[] (2-4 concrete leaks grounded directly in findings/evidence),',
+        '  "aiVisibilityVerdict": string (2-3 sentences covering AI bots, /llms.txt, schema completeness, and brand mention visibility),',
+        '  "gbpActionSummary": string (2-3 sentences covering Google Business Profile state & competitor review/photo gap),',
+        '  "quickWins30Days": string[] (3-4 immediate fixes achievable in 30 days),',
+        '  "strategic90Days": string[] (3-4 compounding upgrades for the 90-day horizon),',
+        '  "clientPitchAngle": string (1-2 sentence opening hook tailored to win this business owner)',
+        '}',
+      ].join('\n'),
+    },
+  ];
+
+  const runCompletion = (msgs: ChatMessage[]) =>
+    completeChat
+      ? completeChat(msgs.map((m) => ({ role: m.role, content: String(m.content) })))
+      : callChatCompletions(settings, msgs, 2200, modelId, 0.25);
+
+  onStage?.(`Running analysis agent (${modelId})...`);
+  const firstRaw = await runCompletion(messages);
+
+  const parseReport = (raw: string) => {
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(stripJsonFences(raw));
+    } catch (err) {
+      return {
+        errorText: `Invalid JSON: ${err instanceof Error ? err.message : 'parse failed'}`,
+      };
+    }
+    const res = SiteReportPayloadSchema.safeParse(parsedJson);
+    if (!res.success) {
+      return { errorText: `Schema validation failed:\n${formatZodIssues(res.error)}` };
+    }
+    return { data: res.data };
+  };
+
+  const firstAttempt = parseReport(firstRaw);
+  let retryReason = firstAttempt.errorText;
+  if (firstAttempt.data) {
+    const grounding = validateReportNumbersGrounded(firstAttempt.data, allowedNumberText);
+    if (grounding.valid) {
+      return SiteAnalysisReportSchema.parse({
+        ...firstAttempt.data,
+        generatedAt: new Date().toISOString(),
+        modelId,
+        providerLabel: getProviderLabel(settings),
+      });
+    }
+    retryReason = `Ungrounded numbers detected: ${grounding.violations.join(', ')}. Use ONLY numbers explicitly present in the evidence JSON (plus 30/90/2027).`;
+  }
+
+  onStage?.('Grounding report numbers — verifying once...');
+  const retryMessages: ChatMessage[] = [
+    ...messages,
+    { role: 'assistant', content: firstRaw },
+    {
+      role: 'user',
+      content: `${retryReason || 'Invalid format.'}\n\nFix and return ONLY valid raw JSON matching the exact schema.`,
+    },
+  ];
+
+  const secondRaw = await runCompletion(retryMessages);
+  const secondAttempt = parseReport(secondRaw);
+  if (secondAttempt.data) {
+    const secondGrounding = validateReportNumbersGrounded(secondAttempt.data, allowedNumberText);
+    return SiteAnalysisReportSchema.parse({
+      ...secondAttempt.data,
+      generatedAt: new Date().toISOString(),
+      modelId,
+      providerLabel: getProviderLabel(settings),
+      needsReview: !secondGrounding.valid ? true : undefined,
+    });
+  }
+
+  throw new Error(`Analysis agent failed validation after retry.\n${secondAttempt.errorText ?? ''}`);
+}
+
+export function siteAnalysisReportToMarkdown(
+  report: SiteAnalysisReport,
+  clientName: string,
+  websiteUrl?: string
+): string {
+  return [
+    `# Site Analysis Report — ${clientName || 'Client'}`,
+    websiteUrl ? `- **Website:** ${websiteUrl}` : null,
+    `- **Generated:** ${new Date(report.generatedAt).toLocaleString()}`,
+    `- **Agent:** ${report.providerLabel} (${report.modelId})`,
+    report.needsReview ? `- **Note:** Verify highlighted figures against the measured scorecard.` : null,
+    '',
+    '## Executive Summary',
+    report.executiveSummary,
+    '',
+    '## Client Pitch Angle',
+    `> ${report.clientPitchAngle}`,
+    '',
+    '## Biggest Revenue Leaks',
+    ...report.biggestRevenueLeaks.map((item) => `- ${item}`),
+    '',
+    '## AI Search Visibility Verdict (ChatGPT / Claude / Perplexity)',
+    report.aiVisibilityVerdict,
+    '',
+    '## Google Business Profile & Competitor Gap',
+    report.gbpActionSummary,
+    '',
+    '## 30-Day Quick Wins',
+    ...report.quickWins30Days.map((item) => `- [ ] ${item}`),
+    '',
+    '## 90-Day Strategic Plan',
+    ...report.strategic90Days.map((item) => `- ${item}`),
+  ]
+    .filter((line): line is string => line !== null)
+    .join('\n');
 }

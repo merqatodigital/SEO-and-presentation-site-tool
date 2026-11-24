@@ -1,0 +1,97 @@
+name: TourForge Site Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Public website URL to audit (https://...)"
+        required: true
+        type: string
+      client_name:
+        description: "Client display name (optional)"
+        required: false
+        type: string
+      business_type:
+        description: "Business type (e.g. Boutique Resort, Dental Clinic)"
+        required: false
+        type: string
+      create_issue:
+        description: "Create a GitHub Issue with the repo action checklist"
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    # Weekly Monday 09:00 UTC check (set repository variable AUDIT_TARGET_URL to enable)
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_URL: ${{ inputs.target_url || vars.AUDIT_TARGET_URL }}
+    steps:
+      - name: Check target URL
+        if: env.TARGET_URL == ''
+        run: |
+          echo "Set inputs.target_url or repository variable AUDIT_TARGET_URL to run scheduled audits."
+          exit 0
+
+      - name: Checkout repository
+        if: env.TARGET_URL != ''
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: env.TARGET_URL != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        if: env.TARGET_URL != ''
+        run: npm ci
+
+      - name: Install headless Chromium for local CI execution (skipped when TOURFORGE_SERVER_URL is set)
+        if: env.TARGET_URL != '' && vars.TOURFORGE_SERVER_URL == ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium fonts-liberation
+
+      - name: Run TourForge deterministic audit
+        if: env.TARGET_URL != ''
+        env:
+          TOURFORGE_SERVER_URL: ${{ vars.TOURFORGE_SERVER_URL }}
+          CAPTURE_TOKEN: ${{ secrets.CAPTURE_TOKEN }}
+          PLAYWRIGHT_EXECUTABLE_PATH: /usr/bin/chromium
+        run: |
+          ARGS="--url $TARGET_URL --out ./audit-output --repo $GITHUB_REPOSITORY"
+          if [ -n "${{ inputs.client_name }}" ]; then
+            ARGS="$ARGS --client \"${{ inputs.client_name }}\""
+          fi
+          if [ -n "${{ inputs.business_type }}" ]; then
+            ARGS="$ARGS --type \"${{ inputs.business_type }}\""
+          fi
+          eval "npm run audit:cli -- $ARGS"
+
+      - name: Upload audit artifacts (Scorecard + UI-importable Bundle + Generated Fixes)
+        if: env.TARGET_URL != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: tourforge-audit
+          path: audit-output/
+          retention-days: 30
+
+      - name: Open GitHub Issue with Repo Change Checklist
+        if: env.TARGET_URL != '' && (inputs.create_issue == true || github.event_name == 'schedule')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Website & AI Audit: ${{ inputs.client_name || env.TARGET_URL }}"
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --body-file ./audit-output/github-issue.md

@@ -1,9 +1,11 @@
 import {
+  AiMentionCheckResultSchema,
   AuditAssumptionsSchema,
   AuditResultSchema,
   ManualFootprintSchema,
   ProspectEntrySchema,
   ScorecardSchema,
+  SiteAnalysisReportSchema,
   createDefaultAssumptions,
   createEmptyManualFootprint,
 } from './types';
@@ -27,6 +29,12 @@ export function migrateImportedBundle(raw: unknown): Partial<FullProjectBundle> 
     ? AuditAssumptionsSchema.safeParse(record.assumptions)
     : null;
   const rawScorecard = record.scorecard ? ScorecardSchema.safeParse(record.scorecard) : null;
+  const rawMentionCheck = record.aiMentionCheck
+    ? AiMentionCheckResultSchema.safeParse(record.aiMentionCheck)
+    : null;
+  const rawAnalysisReport = record.siteAnalysisReport
+    ? SiteAnalysisReportSchema.safeParse(record.siteAnalysisReport)
+    : null;
 
   let prospects = undefined;
   if (Array.isArray(record.prospects)) {
@@ -54,5 +62,7 @@ export function migrateImportedBundle(raw: unknown): Partial<FullProjectBundle> 
     assumptions: rawAssumptions?.success ? rawAssumptions.data : createDefaultAssumptions(),
     scorecard: rawScorecard?.success ? rawScorecard.data : null,
     prospects,
+    aiMentionCheck: rawMentionCheck?.success ? rawMentionCheck.data : null,
+    siteAnalysisReport: rawAnalysisReport?.success ? rawAnalysisReport.data : null,
   };
 }

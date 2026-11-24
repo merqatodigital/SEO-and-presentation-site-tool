@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "selftest": "tsx --test src/audit/audit.test.ts"
+    "selftest": "tsx --test src/audit/audit.test.ts",
+    "audit:cli": "tsx scripts/agent-audit.ts",
+    "mcp": "tsx scripts/mcp-server.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "4.3.5",

@@ -1,6 +1,6 @@
 import React from 'react';
 import { deriveClientName } from '../audit/htmlFindings';
-import { AuditResult, Scorecard } from '../audit/types';
+import { AuditResult, Scorecard, SiteAnalysisReport } from '../audit/types';
 import {
   AISearchLayerData,
   FootprintNode,
@@ -23,6 +23,7 @@ interface PrintProposalViewProps {
   scorecard: Scorecard;
   auditedUrl: string;
   printMode: 'scorecard' | 'proposal';
+  siteAnalysisReport?: SiteAnalysisReport | null;
 }
 
 export const PrintProposalView: React.FC<PrintProposalViewProps> = ({
@@ -36,6 +37,7 @@ export const PrintProposalView: React.FC<PrintProposalViewProps> = ({
   scorecard,
   auditedUrl,
   printMode,
+  siteAnalysisReport,
 }) => {
   const brandContrast = getContrastTextColor(project.brandColor);
   const showScorecardFirstPage = Boolean(audit || scorecard.knownChecks > 0);
@@ -222,6 +224,36 @@ export const PrintProposalView: React.FC<PrintProposalViewProps> = ({
                   ))}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Executive AI Strategy Brief (if generated) */}
+          {siteAnalysisReport && (
+            <div className="mt-7 print-avoid-break">
+              <h2 className="text-lg font-semibold text-slate-900">
+                Executive Site &amp; Visibility Brief
+              </h2>
+              <p className="mt-1 text-xs leading-relaxed text-slate-700">
+                {siteAnalysisReport.executiveSummary}
+              </p>
+              <div className="mt-2.5 grid grid-cols-2 gap-3 text-xs">
+                <div className="rounded-lg border border-slate-200 p-3">
+                  <p className="font-semibold text-slate-900">30-Day Quick Wins</p>
+                  <ul className="mt-1 space-y-1 text-slate-600">
+                    {siteAnalysisReport.quickWins30Days.map((item, idx) => (
+                      <li key={idx}>• {item}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="rounded-lg border border-slate-200 p-3">
+                  <p className="font-semibold text-slate-900">90-Day Growth Plan</p>
+                  <ul className="mt-1 space-y-1 text-slate-600">
+                    {siteAnalysisReport.strategic90Days.map((item, idx) => (
+                      <li key={idx}>• {item}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
             </div>
           )}
 

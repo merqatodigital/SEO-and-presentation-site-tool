@@ -43,21 +43,47 @@ import {
   DEFAULT_AI_SETTINGS,
   DEFAULT_PRICING_TIERS,
   WalkthroughData,
+  buildDefaultAISearchLayer,
   buildDefaultPricingTiers,
   convertPricingTiersCurrency,
   createWalkthroughSchema,
 } from '../types/tour';
-import { generateWalkthrough, validateNumbersGrounded } from '../lib/aiClient';
+import {
+  generateWalkthrough,
+  getEffectiveAnalysisModel,
+  isOllamaBaseUrl,
+  runAiBrandMentionCheck,
+  runSiteAnalysisAgent,
+  validateNumbersGrounded,
+} from '../lib/aiClient';
+import {
+  buildAiReadinessSummary,
+  parseRobotsAiBots,
+} from './aiReadiness';
+import {
+  buildGbpActionPlaybook,
+  computeGbpCompetitorBenchmark,
+} from './gbpPlaybook';
 import {
   SlidingWindowRateLimiter,
   SsrfBlockedError,
   isBearerTokenValid,
   isPrivateOrBlockedIp,
   parseAllowedRelayHosts,
+  resolveServerOllamaOrigin,
   sanitizePlaywrightNavigationError,
   validatePublicTargetUrl,
   validateRelayUrlBeforeDns,
 } from '../../serverShared';
+import {
+  buildAgentMarkdownReport,
+  buildAgentOutputBundle,
+  buildGeneratedRepoAssets,
+  buildGitHubIssueBody,
+  buildRepoChangeChecklist,
+} from './githubReport';
+import { parseCliArgs } from '../../scripts/agent-audit';
+import { handleJsonRpcMessage, handleMcpToolCall } from '../../scripts/mcp-server';
 
 function makeMinimalAudit(findings: AuditResult['findings']): AuditResult {
   return {
@@ -1219,6 +1245,461 @@ test('CURRENCY: Philippine Peso (PHP) is default with USD and EUR options', () =
   });
   assert.equal(estimateUsd.currency, 'USD');
 });
+
+test('AI READINESS: parseRobotsAiBots, rich JSON-LD entity extraction, and summary score', () => {
+  const robots = [
+    'User-agent: *',
+    'Allow: /',
+    '',
+    'User-agent: ClaudeBot',
+    'Disallow: /',
+    '',
+    'User-agent: GPTBot',
+    'Allow: /',
+  ].join('\n');
+
+  const botAccess = parseRobotsAiBots(robots);
+  const claude = botAccess.find((b) => b.bot === 'ClaudeBot');
+  const gpt = botAccess.find((b) => b.bot === 'GPTBot');
+  const perplexity = botAccess.find((b) => b.bot === 'PerplexityBot');
+
+  assert.equal(claude?.status, 'blocked');
+  assert.equal(gpt?.status, 'allowed');
+  assert.equal(perplexity?.status, 'allowed');
+
+  const unknownBots = parseRobotsAiBots(null);
+  assert.equal(unknownBots.every((b) => b.status === 'unknown'), true);
+
+  const html = `
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <title>Bayview Resort</title>
+        <script type="application/ld+json">
+          {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "Hotel",
+                "name": "Bayview Resort",
+                "telephone": "+63 917 555 0199",
+                "priceRange": "$$$",
+                "address": { "@type": "PostalAddress", "streetAddress": "El Nido" },
+                "openingHoursSpecification": [{ "@type": "OpeningHoursSpecification", "description": "24/7" }],
+                "sameAs": ["https://facebook.com/bayview"],
+                "geo": { "@type": "GeoCoordinates", "latitude": 11.18, "longitude": 119.39 }
+              },
+              { "@type": "FAQPage", "mainEntity": [] }
+            ]
+          }
+        </script>
+      </head>
+      <body><h1>Bayview Resort</h1></body>
+    </html>
+  `;
+  const parsed = parseHtmlWithCheerio(html);
+  assert.equal(parsed.jsonLdDetails?.hasAddress, true);
+  assert.equal(parsed.jsonLdDetails?.hasTelephone, true);
+  assert.equal(parsed.jsonLdDetails?.hasOpeningHours, true);
+  assert.equal(parsed.jsonLdDetails?.hasPriceRange, true);
+  assert.equal(parsed.jsonLdDetails?.hasSameAs, true);
+  assert.equal(parsed.jsonLdDetails?.hasFaqPage, true);
+  assert.equal(parsed.jsonLdDetails?.hasGeo, true);
+
+  const audit = makeMinimalAudit([]);
+  audit.parsed = parsed;
+  audit.aiReadiness = {
+    robotsChecked: true,
+    botAccess,
+    llmsTxt: { exists: false, reason: 'HTTP 404' },
+    entityCompleteness: {
+      hasBusinessType: true,
+      hasAddress: true,
+      hasTelephone: true,
+      hasOpeningHours: true,
+      hasPriceRange: true,
+      hasSameAs: true,
+      hasFaqPage: true,
+      hasGeo: true,
+    },
+  };
+
+  const summary = buildAiReadinessSummary(audit);
+  assert.equal(summary.blockedBotsCount, 1);
+  assert.equal(summary.allowedBotsCount, 5);
+  assert.equal(summary.entityFieldsPresent, 8);
+  assert.equal(summary.llmsStatus, 'missing');
+  assert.ok(summary.score !== null && summary.score >= 70 && summary.score <= 85);
+});
+
+test('GBP COMPETITOR BENCHMARK & PLAYBOOK: computes review/photo gap and tailored action plan', () => {
+  const manual = createEmptyManualFootprint();
+  manual.gbp.claimed = 'no';
+  manual.gbp.reviewCount = 24;
+  manual.gbp.averageRating = 4.3;
+  manual.gbp.photoCount = 8;
+  manual.gbp.postsLast90Days = 0;
+  manual.competitors = [
+    {
+      id: 'c1',
+      name: 'Top Smile Clinic',
+      category: 'Dentistry',
+      reviewCount: 120,
+      averageRating: 4.8,
+      photoCount: 40,
+      postsLast90Days: 4,
+    },
+    {
+      id: 'c2',
+      name: 'Metro Dental',
+      category: 'Dentistry',
+      reviewCount: 80,
+      averageRating: 4.6,
+      photoCount: 20,
+      postsLast90Days: 2,
+    },
+  ];
+
+  const benchmark = computeGbpCompetitorBenchmark(manual, 'Harborcrest Dental');
+  assert.equal(benchmark.topCompetitorName, 'Top Smile Clinic');
+  assert.equal(benchmark.topCompetitorReviews, 120);
+  assert.equal(benchmark.reviewGapToLeader, 96);
+  assert.equal(benchmark.avgCompetitorReviews, 100);
+  assert.equal(benchmark.avgCompetitorPhotos, 30);
+
+  const playbook = buildGbpActionPlaybook(
+    manual,
+    {
+      clientName: 'Harborcrest Dental',
+      businessType: 'Family & Cosmetic Dentistry',
+      brief: 'More new patients',
+      brandColor: '#0F766E',
+      logoDataUrl: null,
+      websiteUrl: 'https://harborcrest.ph',
+    },
+    'Harborcrest Dental'
+  );
+  assert.equal(playbook.prioritizedActions.some((a) => a.priority === 'Urgent'), true);
+  assert.equal(playbook.photoShotList.some((s) => /clinic|dentist|reception/i.test(s)), true);
+  assert.equal(playbook.reviewTemplates.length >= 2, true);
+  assert.equal(playbook.qaSeeds.length >= 3, true);
+});
+
+test('OLLAMA BRIDGE & MODEL RESOLUTION: validates safe server origin and local baseUrl detection', () => {
+  assert.equal(resolveServerOllamaOrigin(undefined)?.origin, 'http://127.0.0.1:11434');
+  assert.equal(resolveServerOllamaOrigin('disabled'), null);
+  assert.equal(resolveServerOllamaOrigin('none'), null);
+  assert.equal(resolveServerOllamaOrigin('ftp://localhost:11434'), null);
+  assert.equal(resolveServerOllamaOrigin('http://user:pass@127.0.0.1:11434'), null);
+  assert.equal(resolveServerOllamaOrigin('http://localhost:11434/v1')?.origin, 'http://localhost:11434');
+
+  assert.equal(isOllamaBaseUrl('http://127.0.0.1:11434/v1'), true);
+  assert.equal(isOllamaBaseUrl('http://localhost:11434'), true);
+  assert.equal(isOllamaBaseUrl('https://openrouter.ai/api/v1'), false);
+
+  assert.equal(
+    getEffectiveAnalysisModel({
+      ...DEFAULT_AI_SETTINGS,
+      model: 'vision-model',
+      analysisModel: 'qwen2.5:14b',
+    }),
+    'qwen2.5:14b'
+  );
+  assert.equal(
+    getEffectiveAnalysisModel({
+      ...DEFAULT_AI_SETTINGS,
+      model: 'vision-model',
+      analysisModel: '',
+    }),
+    'vision-model'
+  );
+});
+
+test('AI MENTION CHECK & SITE ANALYSIS AGENT: validates Zod schema and enforces numeric grounding', async () => {
+  const project = {
+    clientName: 'Palawan Cove Resort',
+    businessType: 'Boutique Beach Resort',
+    brief: 'Direct bookings in El Nido with 24-hour reception.',
+    brandColor: '#0F766E',
+    logoDataUrl: null,
+    websiteUrl: 'https://palawancove.ph',
+  };
+  const aiSearchLayer = buildDefaultAISearchLayer(project, null, null);
+  const manual = createEmptyManualFootprint();
+  const audit = makeMinimalAudit([
+    {
+      id: 'speed-lcp',
+      category: 'speed',
+      label: 'Main content load time (LCP)',
+      status: 'fail',
+      evidence: 'LCP 4.8 s',
+      fix: 'Compress hero media',
+      businessImpact: 'Mobile visitors drop off before seeing rooms',
+      weight: 5,
+    },
+  ]);
+  const scorecard = computeScorecard(audit, manual, createDefaultAssumptions());
+
+  const mentionResult = await runAiBrandMentionCheck({
+    settings: {
+      ...DEFAULT_AI_SETTINGS,
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      analysisModel: 'llama3.2:latest',
+    },
+    project,
+    audit,
+    aiSearchLayer,
+    completeChat: async () =>
+      JSON.stringify({
+        results: [
+          {
+            query: 'Best Boutique Beach Resort in El Nido',
+            clientMentioned: false,
+            citedDomain: false,
+            competitorsMentioned: ['Booking.com', 'Agoda'],
+            summary: 'AI assistants primarily list OTA directories rather than Palawan Cove Resort directly.',
+          },
+          {
+            query: 'Top Boutique Beach Resort direct booking',
+            clientMentioned: true,
+            citedDomain: false,
+            competitorsMentioned: ['TripAdvisor'],
+            summary: 'Mentioned by name without verified domain link.',
+          },
+          {
+            query: 'Compare beach resorts',
+            clientMentioned: false,
+            citedDomain: false,
+            competitorsMentioned: ['Agoda'],
+            summary: 'Not named in general comparison.',
+          },
+        ],
+      }),
+  });
+  assert.equal(mentionResult.overallVisibility, 'partial');
+  assert.equal(mentionResult.searchCapable, false);
+  assert.equal(mentionResult.results.length, 3);
+
+  // Site analysis agent: verify retry when model fabricates a number ("47%"), and verify needsReview if persisted
+  let calls = 0;
+  let sawUngroundedFeedback = false;
+  const report = await runSiteAnalysisAgent({
+    settings: {
+      ...DEFAULT_AI_SETTINGS,
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      analysisModel: 'qwen2.5:7b',
+    },
+    project,
+    audit,
+    scorecard,
+    manualFootprint: manual,
+    aiSearchLayer,
+    aiMentionCheck: mentionResult,
+    completeChat: async (messages) => {
+      calls++;
+      if (calls === 2) {
+        const last = String(messages[messages.length - 1]?.content ?? '');
+        sawUngroundedFeedback = last.includes('47%');
+        return JSON.stringify({
+          executiveSummary: 'Palawan Cove Resort faces slow mobile loading at LCP 4.8 s.',
+          biggestRevenueLeaks: ['Mobile LCP of 4.8 s delays first impression for arriving guests.'],
+          aiVisibilityVerdict: 'AI visibility requires rich Schema markup and direct citations.',
+          gbpActionSummary: 'Complete GBP verification and add local competitor tracking.',
+          quickWins30Days: ['Optimize hero image to lower LCP from 4.8 s.', 'Publish Schema JSON-LD.'],
+          strategic90Days: ['Launch steady review velocity campaign.'],
+          clientPitchAngle: 'Turn mobile browsers into commission-free direct bookings.',
+        });
+      }
+      return JSON.stringify({
+        executiveSummary: 'Palawan Cove Resort loses 47% of guests due to LCP 4.8 s.',
+        biggestRevenueLeaks: ['Slow LCP 4.8 s hurts conversion.'],
+        aiVisibilityVerdict: 'Missing structured data.',
+        gbpActionSummary: 'Needs more reviews.',
+        quickWins30Days: ['Fix hero image.'],
+        strategic90Days: ['Build direct booking funnel.'],
+        clientPitchAngle: 'Capture direct bookings without OTA fees.',
+      });
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(sawUngroundedFeedback, true);
+  assert.equal(report.needsReview, undefined);
+  assert.equal(report.providerLabel, 'Local Ollama');
+});
+
+test('BUNDLE MIGRATION: preserves backward compatibility with legacy v1 bundles lacking new fields', () => {
+  const legacyBundle = {
+    schemaVersion: '1.0',
+    exportedAt: '2026-01-01T00:00:00.000Z',
+    project: {
+      clientName: 'Legacy Hotel',
+      businessType: 'Hotel',
+      brief: 'Direct bookings',
+      brandColor: '#0F766E',
+      logoDataUrl: null,
+    },
+    walkthrough: {
+      title: 'Legacy Tour',
+      scenes: [
+        {
+          screenshotIndex: 0,
+          narration: 'Grow bookings into 2027.',
+          caption: 'Hero',
+          highlight: { x: 10, y: 10, w: 30, h: 20 },
+        },
+      ],
+      outcomes: [{ title: 'More bookings', description: 'Direct conversions' }],
+      roadmap: [{ quarter: 'Q1', items: ['Launch'] }],
+    },
+  };
+  const migrated = migrateImportedBundle(legacyBundle);
+  assert.equal(migrated.project?.clientName, 'Legacy Hotel');
+  assert.equal(migrated.aiMentionCheck, null);
+  assert.equal(migrated.siteAnalysisReport, null);
+});
+
+test('GITHUB REPORT & AGENT BUNDLE: maps failing findings to repo files and exports valid UI-importable bundle', () => {
+  const manual = createEmptyManualFootprint();
+  const audit = makeMinimalAudit([
+    {
+      id: 'seo-robots',
+      category: 'seo',
+      label: 'Search crawler rules (robots.txt)',
+      status: 'fail',
+      evidence: 'Blanket Disallow: / blocks crawlers',
+      fix: 'Allow public pages and AI search crawlers in robots.txt',
+      businessImpact: 'Invisible to Google and AI assistants',
+      weight: 5,
+    },
+    {
+      id: 'contact-booking-cta',
+      category: 'contact',
+      label: 'Clear booking / contact call-to-action',
+      status: 'fail',
+      evidence: 'No booking button found',
+      fix: 'Add Book Now button in header',
+      businessImpact: 'Lost direct bookings',
+      weight: 5,
+    },
+  ]);
+  audit.aiReadiness = {
+    robotsChecked: true,
+    botAccess: parseRobotsAiBots('User-agent: *\nDisallow: /'),
+    llmsTxt: { exists: false, reason: 'HTTP 404' },
+    entityCompleteness: {
+      hasBusinessType: false,
+      hasAddress: false,
+      hasTelephone: false,
+      hasOpeningHours: false,
+      hasPriceRange: false,
+      hasSameAs: false,
+      hasFaqPage: false,
+      hasGeo: false,
+    },
+  };
+
+  const scorecard = computeScorecard(audit, manual, createDefaultAssumptions());
+  const aiSummary = buildAiReadinessSummary(audit);
+  const repoChanges = buildRepoChangeChecklist(audit, aiSummary);
+
+  assert.equal(repoChanges.some((c) => c.findingId === 'seo-robots' && c.priority === 'P0' && c.targetRepoPaths.includes('public/robots.txt')), true);
+  assert.equal(repoChanges.some((c) => c.findingId === 'ai-llms-txt' && c.targetRepoPaths.includes('public/llms.txt')), true);
+  assert.equal(repoChanges.some((c) => c.findingId === 'contact-booking-cta' && c.priority === 'P0'), true);
+
+  const bundle = buildAgentOutputBundle({
+    url: 'https://example-resort.ph',
+    clientName: 'Example Resort',
+    businessType: 'Boutique Resort',
+    audit,
+    scorecard,
+    manual,
+  });
+  const migrated = migrateImportedBundle(bundle);
+  assert.equal(migrated.project?.clientName, 'Example Resort');
+  assert.equal(migrated.audit?.requestedUrl, 'https://example-resort.ph');
+  assert.ok(migrated.aiSearchLayer?.faqs.length);
+
+  const assets = buildGeneratedRepoAssets(bundle.project, bundle.aiSearchLayer!, audit, manual);
+  assert.match(assets.robotsTxt, /OAI-SearchBot/);
+  assert.match(assets.llmsTxt, /Example Resort/);
+  assert.match(assets.schemaJsonLdTag, /application\/ld\+json/);
+
+  const reportMd = buildAgentMarkdownReport({
+    url: 'https://example-resort.ph',
+    repoName: 'agency/example-resort-web',
+    project: bundle.project,
+    audit,
+    scorecard,
+    aiSummary,
+    repoChanges,
+  });
+  assert.match(reportMd, /agency\/example-resort-web/);
+  assert.match(reportMd, /public\/robots\.txt/);
+
+  const issueMd = buildGitHubIssueBody({
+    url: 'https://example-resort.ph',
+    project: bundle.project,
+    scorecard,
+    aiSummary,
+    repoChanges,
+  });
+  assert.match(issueMd, /- \[ \] \*\*\[P0\]/);
+});
+
+test('AGENT CLI & MCP SERVER: parses CLI args and responds to JSON-RPC initialize, tools/list, and tools/call', async () => {
+  const cli = parseCliArgs([
+    '--url',
+    'https://resort.ph',
+    '--out',
+    './audits/resort',
+    '--server',
+    'http://127.0.0.1:3000',
+    '--currency',
+    'USD',
+    '--ai',
+  ]);
+  assert.equal('help' in cli, false);
+  if (!('help' in cli)) {
+    assert.equal(cli.url, 'https://resort.ph');
+    assert.equal(cli.outDir, './audits/resort');
+    assert.equal(cli.serverUrl, 'http://127.0.0.1:3000');
+    assert.equal(cli.currency, 'USD');
+    assert.equal(cli.runAi, true);
+  }
+
+  const initReply = await handleJsonRpcMessage({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+  });
+  assert.equal((initReply?.result as { serverInfo?: { name?: string } })?.serverInfo?.name, 'tourforge-lite');
+
+  const listReply = await handleJsonRpcMessage({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/list',
+  });
+  const tools = (listReply?.result as { tools?: Array<{ name: string }> })?.tools ?? [];
+  assert.equal(tools.some((t) => t.name === 'tourforge_audit_url'), true);
+  assert.equal(tools.some((t) => t.name === 'tourforge_generate_repo_fixes'), true);
+  assert.equal(tools.some((t) => t.name === 'tourforge_export_bundle'), true);
+
+  const fixesResult = await handleMcpToolCall('tourforge_generate_repo_fixes', {
+    url: 'https://example-resort.ph',
+    clientName: 'Mabuhay Villas',
+    auditResult: makeMinimalAudit([]),
+  });
+  const parsedFixes = JSON.parse(fixesResult.content[0].text) as {
+    files: Record<string, string>;
+    githubIssueMarkdown: string;
+  };
+  assert.match(parsedFixes.files['public/robots.txt'], /PerplexityBot/);
+  assert.match(parsedFixes.files['public/llms.txt'], /Mabuhay Villas/);
+  assert.match(parsedFixes.githubIssueMarkdown, /Mabuhay Villas/);
+});
+
+
 
 
 

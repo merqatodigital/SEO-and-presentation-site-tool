@@ -241,9 +241,26 @@ When `headersChecked === true` and `highSeverityCount === 0` (`audit.security.ba
 
 ---
 
+## Bounded Auto-Fix & Preview Re-Audit
+
+TourForge Lite can apply **only** deterministic allowlisted fixes it already generates (`vercel.json`, `next.config.js`, `_headers`, `nginx.conf`, `public/robots.txt`, `public/llms.txt`, `public/schema.jsonld`, `generated/security-badge.html`, and explicit `TOURFORGE:*` metadata placeholders in `index.html` / `app/layout.tsx`). It never edits `.env*`, secrets, lockfiles, or application source code, never deletes files, and never pushes to `main`. Unknown or ambiguous findings remain as GitHub Issues.
+
+```bash
+# 1. Dry-run by default: shallow-clones repo, generates ApplyPlan + diff without pushing
+npm run fix:repo -- --repo owner/client-repo --audit ./audits/client/tourforge-bundle.json --dry-run
+
+# 2. Apply explicitly: runs repo lint/build (aborts with no push on failure), pushes fix/tourforge-<date>, opens a Draft PR via gh
+npm run fix:repo -- --repo owner/client-repo --audit ./audits/client/tourforge-bundle.json --apply
+
+# 3. Verify against the PR preview deployment and post "before X -> after Y" category deltas to the PR
+npm run verify:fix -- --url https://preview-url.example --bundle ./audits/client/tourforge-bundle.json --pr 42 --repo owner/client-repo
+```
+
+---
+
 ## Handoff to Agents
 
-The entire audit, scoring, NAP matching, and JSON-LD generation layer in `src/audit/*` is **pure, portable TypeScript** with **zero DOM/browser, React, or AI SDK dependencies**:
+The entire audit, scoring, NAP matching, bounded fix planning, and JSON-LD generation layer in `src/audit/*` and `src/fix/*` is **pure, portable TypeScript** with **zero DOM/browser, React, or AI SDK dependencies**:
 
 - `src/audit/types.ts` — Canonical Zod schemas and TypeScript contracts (`AuditResult`, `AuditFinding`, `SecurityFinding`, `PassiveSecurityAudit`, `ManualFootprint`, `AuditAssumptions`, `Scorecard`, `ProspectEntry`).
 - `src/audit/htmlFindings.ts` — Pure Cheerio HTML extraction, CTA matching, client name derivation, and deterministic automated check evaluation.
@@ -251,7 +268,8 @@ The entire audit, scoring, NAP matching, and JSON-LD generation layer in `src/au
 - `src/audit/nap.ts` — Pure business name, phone, and address token normalization plus directory consistency findings.
 - `src/audit/scorecard.ts` — Deterministic weighted category scoring (`securityScore` at 10%), `<50%` insufficient-data exclusion, `<70%` provisional flag, Fix First sorting, ignored-leads range math, and outreach summary generator.
 - `src/audit/githubReport.ts` — Repo file change mapping, `vercel.json` / `next.config.js` / `_headers` / `nginx.conf` security header snippets, Markdown reports, and bundle export builders.
+- `src/fix/plan.ts` — Pure `ApplyPlan` generator, strict path allowlist (`ALLOWLISTED_FIX_PATHS`), non-destructive config mergers, placeholder replacer, and secret redactor.
 - `src/audit/jsonLd.ts` — Schema JSON-LD builder and `JSON.parse` validator.
 - `src/audit/bundleMigration.ts` — Backward-compatible `v1`/`v2` project JSON import migration.
 
-External worker queues, CLI runners, or agent pipelines can import `src/audit/*` directly in Node/Bun/edge workers with strict Zod-validated JSON inputs and outputs.
+External worker queues, CLI runners, or agent pipelines can import `src/audit/*` and `src/fix/plan.ts` directly in Node/Bun/edge workers with strict Zod-validated JSON inputs and outputs.

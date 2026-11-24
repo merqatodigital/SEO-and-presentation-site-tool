@@ -12,6 +12,8 @@
     "lint": "tsc --noEmit",
     "selftest": "tsx --test src/audit/audit.test.ts",
     "audit:cli": "tsx scripts/agent-audit.ts",
+    "fix:repo": "tsx scripts/apply-repo-fixes.ts",
+    "verify:fix": "tsx scripts/verify-fix.ts",
     "mcp": "tsx scripts/mcp-server.ts"
   },
   "dependencies": {

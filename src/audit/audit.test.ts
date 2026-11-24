@@ -1,5 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile as execFileCb } from 'node:child_process';
+import fs from 'node:fs/promises';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import {
   AuditResultSchema,
   AUDIT_CATEGORIES,
@@ -88,8 +95,35 @@ import {
   buildSecurityBadgeSnippet,
   buildSecurityBadgeSvg,
 } from './securityFindings';
+import {
+  ALLOWLISTED_FIX_PATHS,
+  applyMetadataPlaceholders,
+  buildApplyPlan,
+  isAllowlistedFixPath,
+  mergeNetlifyHeaders,
+  mergeNextConfigJs,
+  mergeNginxConf,
+  mergeRobotsTxt,
+  mergeVercelJsonConfig,
+  redactSecretsFromText,
+} from '../fix/plan';
 import { parseCliArgs } from '../../scripts/agent-audit';
-import { handleJsonRpcMessage, handleMcpToolCall } from '../../scripts/mcp-server';
+import {
+  executeApplyRepoFixes,
+  parseApplyCliArgs,
+  validateFixBranchName,
+  validateRepoSlug,
+} from '../../scripts/apply-repo-fixes';
+import {
+  MCP_TOOLS,
+  handleJsonRpcMessage,
+  handleMcpToolCall,
+} from '../../scripts/mcp-server';
+import {
+  computeScoreDeltaReport,
+  executeVerifyFix,
+  parseVerifyCliArgs,
+} from '../../scripts/verify-fix';
 
 function makeMinimalAudit(findings: AuditResult['findings']): AuditResult {
   return {
@@ -2135,6 +2169,599 @@ test('PASSIVE SECURITY GITHUB & MCP: maps high-severity findings to vercel/next/
   assert.match(mcpData.files['_headers'], /X-Content-Type-Options: nosniff/);
   assert.match(mcpData.files['nginx.conf'], /add_header Strict-Transport-Security/);
   assert.match(mcpData.files['security-badge.html'], /Security Passed/);
+});
+
+test('BOUNDED FIX PLAN: enforces strict allowlist, handles unknown findings safely, and rejects protected files', () => {
+  assert.equal(ALLOWLISTED_FIX_PATHS.includes('vercel.json'), true);
+  assert.equal(ALLOWLISTED_FIX_PATHS.includes('public/robots.txt'), true);
+  assert.equal(ALLOWLISTED_FIX_PATHS.includes('generated/security-badge.html'), true);
+
+  for (const good of ALLOWLISTED_FIX_PATHS) {
+    assert.equal(isAllowlistedFixPath(good).allowed, true, `Expected ${good} to be allowlisted`);
+  }
+  for (const bad of [
+    '.env',
+    '.env.production',
+    'package-lock.json',
+    'bun.lock',
+    'yarn.lock',
+    '../.env',
+    '/etc/passwd',
+    'src/App.tsx',
+    'config/secrets.json',
+    '.git/config',
+  ]) {
+    assert.equal(isAllowlistedFixPath(bad).allowed, false, `Expected ${bad} to be rejected`);
+  }
+
+  const secAudit = analyzePassiveSecurity({
+    finalUrl: 'https://bounded-plan.example/',
+    isHttps: true,
+    html: '<!doctype html><html lang="en"><head><title>Bounded Villa</title></head><body><h1>Villa</h1></body></html>',
+    headers: { 'content-type': 'text/html' },
+  });
+  const audit = makeMinimalAudit([
+    ...secAudit.findings,
+    {
+      id: 'seo-robots',
+      category: 'seo',
+      label: 'Search crawler rules (robots.txt)',
+      status: 'fail',
+      evidence: 'Blanket Disallow: / blocks crawlers',
+      fix: 'Allow crawlers',
+      businessImpact: 'Invisible',
+      weight: 5,
+    },
+    {
+      id: 'seo-title',
+      category: 'seo',
+      label: 'Title tag',
+      status: 'fail',
+      evidence: 'Missing title',
+      fix: 'Add title',
+      businessImpact: 'Low CTR',
+      weight: 3,
+    },
+    {
+      id: 'contact-booking-cta',
+      category: 'contact',
+      label: 'Clear booking CTA',
+      status: 'fail',
+      evidence: 'No booking button',
+      fix: 'Add booking CTA in header',
+      businessImpact: 'Lost leads',
+      weight: 5,
+    },
+    {
+      id: 'speed-lcp',
+      category: 'speed',
+      label: 'LCP',
+      status: 'unknown',
+      evidence: 'Timed out',
+      fix: 'Retry',
+      businessImpact: 'Unknown',
+      weight: 5,
+    },
+  ]);
+  audit.security = secAudit;
+  audit.aiReadiness = {
+    robotsChecked: true,
+    botAccess: parseRobotsAiBots('User-agent: *\nDisallow: /'),
+    llmsTxt: { exists: false, reason: 'HTTP 404' },
+    entityCompleteness: {
+      hasBusinessType: false,
+      hasAddress: false,
+      hasTelephone: false,
+      hasOpeningHours: false,
+      hasPriceRange: false,
+      hasSameAs: false,
+      hasFaqPage: false,
+      hasGeo: false,
+    },
+  };
+
+  const aiSummary = buildAiReadinessSummary(audit);
+  const repoChanges = buildRepoChangeChecklist(audit, aiSummary);
+  // Inject both a protected path snippet and an unknown finding into repoChanges to verify planner guardrails
+  repoChanges.push({
+    findingId: 'custom-unsafe-test',
+    priority: 'P1',
+    severity: 'high',
+    title: 'Should reject .env write',
+    evidence: 'Test evidence',
+    actionSummary: 'Do not write .env',
+    targetRepoPaths: ['.env', 'package-lock.json'],
+    snippets: {
+      '.env': 'API_KEY=secret123',
+      'package-lock.json': '{}',
+    },
+  });
+  repoChanges.push({
+    findingId: 'speed-lcp',
+    priority: 'P1',
+    severity: 'medium',
+    title: 'Unknown LCP finding',
+    evidence: 'Timed out',
+    actionSummary: 'Retry speed test',
+    targetRepoPaths: ['index.html'],
+  });
+
+  const plan = buildApplyPlan({
+    audit,
+    repoChanges,
+    existingFiles: ['vercel.json', 'index.html', 'package.json'],
+    now: new Date('2026-11-23T00:00:00.000Z'),
+  });
+
+  assert.equal(plan.actions.some((a) => a.path === 'vercel.json' && a.safe && a.operation === 'merge-config'), true);
+  assert.equal(plan.actions.some((a) => a.path === 'public/robots.txt' && a.safe), true);
+  assert.equal(plan.actions.some((a) => a.path === 'public/llms.txt' && a.safe), true);
+  assert.equal(plan.actions.some((a) => a.path === 'index.html' && a.safe && a.operation === 'replace-placeholder'), true);
+  assert.equal(plan.actions.some((a) => a.path === '.env' && a.safe === false), true);
+  assert.equal(plan.actions.some((a) => a.path === 'package-lock.json' && a.safe === false), true);
+  assert.equal(plan.actions.filter((a) => a.safe).every((a) => isAllowlistedFixPath(a.path).allowed), true);
+  assert.equal(plan.unhandledFindings.some((u) => u.findingId === 'contact-booking-cta'), true);
+  assert.equal(plan.unhandledFindings.some((u) => u.findingId === 'speed-lcp'), true);
+});
+
+test('BOUNDED FIX MERGERS: merges headers safely, skips ambiguous configs, and redacts secrets', () => {
+  // 1. vercel.json preserves existing config + existing headers and appends missing ones
+  const existingVercel = JSON.stringify(
+    {
+      framework: 'nextjs',
+      headers: [
+        {
+          source: '/(.*)',
+          headers: [{ key: 'X-Custom-Header', value: 'keep-me' }],
+        },
+      ],
+    },
+    null,
+    2
+  );
+  const snippetVercel = JSON.stringify({
+    headers: [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'X-Custom-Header', value: 'overwrite-attempt' },
+          { key: 'Content-Security-Policy', value: "default-src 'self'" },
+        ],
+      },
+    ],
+  });
+  const mergedVercel = mergeVercelJsonConfig(existingVercel, snippetVercel);
+  assert.equal(mergedVercel.ok, true);
+  assert.equal(mergedVercel.changed, true);
+  const parsedVercel = JSON.parse(mergedVercel.content) as {
+    framework: string;
+    headers: Array<{ headers: Array<{ key: string; value: string }> }>;
+  };
+  assert.equal(parsedVercel.framework, 'nextjs');
+  assert.equal(
+    parsedVercel.headers[0].headers.find((h) => h.key === 'X-Custom-Header')?.value,
+    'keep-me'
+  );
+  assert.equal(
+    parsedVercel.headers[0].headers.some((h) => h.key === 'Content-Security-Policy'),
+    true
+  );
+
+  // Ambiguous vercel.json skips
+  assert.equal(mergeVercelJsonConfig('{ "headers": "not-an-array" }', snippetVercel).ok, false);
+
+  // 2. Netlify _headers merge
+  const mergedHeaders = mergeNetlifyHeaders(
+    '/*\n  X-Frame-Options: DENY\n\n/assets/*\n  Cache-Control: max-age=3600\n',
+    '/*\n  X-Frame-Options: SAMEORIGIN\n  X-Content-Type-Options: nosniff\n'
+  );
+  assert.equal(mergedHeaders.ok, true);
+  assert.equal(mergedHeaders.changed, true);
+  assert.match(mergedHeaders.content, /X-Frame-Options: DENY/);
+  assert.equal(mergedHeaders.content.includes('SAMEORIGIN'), false);
+  assert.match(mergedHeaders.content, /X-Content-Type-Options: nosniff/);
+
+  // 3. nginx.conf single vs multiple server blocks
+  const singleNginx = 'server {\n  listen 443 ssl;\n  server_name example.com;\n}\n';
+  const mergedNginx = mergeNginxConf(
+    singleNginx,
+    'add_header X-Content-Type-Options "nosniff" always;\nserver_tokens off;\n'
+  );
+  assert.equal(mergedNginx.ok, true);
+  assert.match(mergedNginx.content, /add_header X-Content-Type-Options/);
+
+  const multiNginx = 'server {\n  listen 80;\n}\nserver {\n  listen 443;\n}\n';
+  assert.equal(mergeNginxConf(multiNginx, 'server_tokens off;').ok, false);
+
+  // 4. next.config.js plain vs wrapped/existing headers
+  const plainNext = 'const nextConfig = {\n  reactStrictMode: true,\n};\nmodule.exports = nextConfig;\n';
+  const snippetNext =
+    'module.exports = {\n  async headers() {\n    return [{ source: "/(.*)", headers: [] }];\n  },\n};\n';
+  const mergedNext = mergeNextConfigJs(plainNext, snippetNext);
+  assert.equal(mergedNext.ok, true);
+  assert.match(mergedNext.content, /async headers\(\)/);
+
+  const wrappedNext = 'module.exports = withMDX({ reactStrictMode: true });\n';
+  assert.equal(mergeNextConfigJs(wrappedNext, snippetNext).ok, false);
+
+  // 5. robots.txt refusal on blanket Disallow: /
+  assert.equal(mergeRobotsTxt('User-agent: *\nDisallow: /\n', 'User-agent: *\nAllow: /\n').ok, false);
+  const okRobots = mergeRobotsTxt('User-agent: *\nAllow: /\n', 'User-agent: *\nAllow: /\n');
+  assert.equal(okRobots.ok, true);
+  assert.match(okRobots.content, /OAI-SearchBot/);
+
+  // 6. Metadata placeholder replacement
+  const tplHtml =
+    '<html><head><!-- TOURFORGE:SEO_TITLE --><!-- TOURFORGE:META_DESCRIPTION --><!-- TOURFORGE:JSONLD --></head><body></body></html>';
+  const patchedHtml = applyMetadataPlaceholders(tplHtml, 'index.html', {
+    title: 'Coral Resort',
+    description: 'Beachfront resort',
+    schemaJsonLdTag: '<script type="application/ld+json">{}</script>',
+  });
+  assert.equal(patchedHtml.ok, true);
+  assert.match(patchedHtml.content, /<title>Coral Resort<\/title>/);
+  assert.match(patchedHtml.content, /<meta name="description" content="Beachfront resort" \/>/);
+  assert.match(patchedHtml.content, /application\/ld\+json/);
+
+  assert.equal(
+    applyMetadataPlaceholders('<html><head><title>Existing</title></head></html>', 'index.html', {
+      title: 'New',
+    }).ok,
+    false
+  );
+
+  // 7. Secret redaction helper
+  const synthToken = ['ghp_', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ999999'].join('');
+  const synthAws = ['AKIA', 'IOSFODNN7EXAMPLE'].join('');
+  const redacted = redactSecretsFromText(`token=${synthToken} aws=${synthAws} Bearer mySuperSecretBearerToken12345`);
+  assert.equal(redacted.includes(synthToken), false);
+  assert.equal(redacted.includes(synthAws), false);
+  assert.equal(redacted.includes('mySuperSecretBearerToken12345'), false);
+});
+
+test('APPLY REPO FIXES INTEGRATION: bare git fixture supports --dry-run, --apply with Draft PR, and build-failure abort with zero push', async () => {
+  const execFile = promisify(execFileCb);
+  const runGit = async (args: string[], cwd: string) =>
+    execFile('git', args, { cwd, maxBuffer: 5 * 1024 * 1024 });
+
+  const cliDefaults = parseApplyCliArgs(['--repo', 'agency/client-site', '--audit', 'bundle.json']);
+  assert.equal('help' in cliDefaults, false);
+  if (!('help' in cliDefaults)) {
+    assert.equal(cliDefaults.dryRun, true);
+  }
+  assert.throws(() => validateRepoSlug('invalid slug/with spaces'));
+  assert.throws(() => validateFixBranchName('main'));
+  assert.throws(() => validateFixBranchName('master'));
+  assert.throws(() => validateFixBranchName('feature/no-fix-prefix'));
+
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'tourforge-git-fixture-'));
+  try {
+    const bareDir = path.join(tmpRoot, 'origin.git');
+    const seedDir = path.join(tmpRoot, 'seed');
+    await fs.mkdir(bareDir, { recursive: true });
+    await fs.mkdir(seedDir, { recursive: true });
+
+    await runGit(['init', '--bare'], bareDir);
+    await runGit(['symbolic-ref', 'HEAD', 'refs/heads/main'], bareDir);
+
+    await runGit(['init'], seedDir);
+    await runGit(['checkout', '-b', 'main'], seedDir);
+    await runGit(['config', 'user.name', 'Test Author'], seedDir);
+    await runGit(['config', 'user.email', 'test@example.com'], seedDir);
+
+    await fs.writeFile(
+      path.join(seedDir, 'package.json'),
+      JSON.stringify(
+        {
+          name: 'client-site',
+          private: true,
+          scripts: {
+            lint: 'node -e "process.exit(0)"',
+            build: 'node -e "process.exit(0)"',
+          },
+        },
+        null,
+        2
+      ) + '\n',
+      'utf8'
+    );
+    await fs.writeFile(
+      path.join(seedDir, 'vercel.json'),
+      JSON.stringify(
+        {
+          headers: [
+            {
+              source: '/(.*)',
+              headers: [{ key: 'X-Custom-Existing', value: '1' }],
+            },
+          ],
+        },
+        null,
+        2
+      ) + '\n',
+      'utf8'
+    );
+    await fs.writeFile(path.join(seedDir, 'README.md'), '# Client Site\n', 'utf8');
+
+    await runGit(['add', '.'], seedDir);
+    await runGit(['commit', '-m', 'Initial commit'], seedDir);
+    await runGit(['remote', 'add', 'origin', bareDir], seedDir);
+    await runGit(['push', '-u', 'origin', 'main'], seedDir);
+
+    const secAudit = analyzePassiveSecurity({
+      finalUrl: 'https://client-site.example/',
+      isHttps: true,
+      html: '<!doctype html><html lang="en"><head><title>Client Site</title></head><body><h1>Client Site</h1></body></html>',
+      headers: { 'content-type': 'text/html' },
+    });
+    const audit = makeMinimalAudit([
+      ...secAudit.findings,
+      {
+        id: 'seo-robots',
+        category: 'seo',
+        label: 'Search crawler rules (robots.txt)',
+        status: 'fail',
+        evidence: 'Blanket Disallow: /',
+        fix: 'Allow crawlers',
+        businessImpact: 'Hidden from AI and search',
+        weight: 5,
+      },
+    ]);
+    audit.security = secAudit;
+    const bundle = buildAgentOutputBundle({
+      url: 'https://client-site.example/',
+      clientName: 'Client Site',
+      businessType: 'Boutique Resort',
+      audit,
+      scorecard: computeScorecard(audit, createEmptyManualFootprint(), createDefaultAssumptions()),
+      manual: createEmptyManualFootprint(),
+    });
+
+    const cloneUrl = pathToFileURL(bareDir).href;
+
+    // 1. Dry-run: must compute diff without writing to bare origin
+    const dryRes = await executeApplyRepoFixes({
+      repo: 'agency/client-site',
+      bundle: bundle as unknown as Record<string, unknown>,
+      branch: 'fix/tourforge-2026-11-23',
+      dryRun: true,
+      deps: { cloneSource: cloneUrl },
+    });
+    assert.equal(dryRes.dryRun, true);
+    assert.equal(dryRes.applied, false);
+    assert.equal(dryRes.prUrl, null);
+    assert.equal(dryRes.appliedFiles.some((f) => f.path === 'vercel.json'), true);
+    assert.equal(dryRes.appliedFiles.some((f) => f.path === 'public/robots.txt'), true);
+    assert.match(dryRes.diff, /X-Custom-Existing/);
+    assert.match(dryRes.diff, /Content-Security-Policy/);
+
+    const headsAfterDry = (await runGit(['ls-remote', '--heads', bareDir], tmpRoot)).stdout;
+    assert.equal(headsAfterDry.includes('fix/tourforge-2026-11-23'), false);
+
+    // 2. Apply mode: pushes branch fix/tourforge-2026-11-23 and invokes Draft PR creator
+    const prCalls: Array<{ repo: string; branch: string; title: string; body: string }> = [];
+    const applyRes = await executeApplyRepoFixes({
+      repo: 'agency/client-site',
+      bundle: bundle as unknown as Record<string, unknown>,
+      branch: 'fix/tourforge-2026-11-23',
+      dryRun: false,
+      deps: {
+        cloneSource: cloneUrl,
+        createDraftPr: async (args) => {
+          prCalls.push(args);
+          return 'https://github.com/agency/client-site/pull/42';
+        },
+      },
+    });
+    assert.equal(applyRes.applied, true);
+    assert.equal(applyRes.prUrl, 'https://github.com/agency/client-site/pull/42');
+    assert.equal(prCalls.length, 1);
+    const prCallArgs = prCalls[0];
+    assert.equal(prCallArgs.branch, 'fix/tourforge-2026-11-23');
+    assert.match(prCallArgs.body, /Before Overall Score:/);
+    assert.match(prCallArgs.body, /Before Passive Security Score:/);
+    assert.match(prCallArgs.body, /Re-run audit against preview URL to confirm/);
+
+    const headsAfterApply = (await runGit(['ls-remote', '--heads', bareDir], tmpRoot)).stdout;
+    assert.equal(headsAfterApply.includes('refs/heads/fix/tourforge-2026-11-23'), true);
+
+    // Verify pushed vercel.json kept original header and added CSP
+    const showVercel = (await runGit(['show', 'fix/tourforge-2026-11-23:vercel.json'], bareDir)).stdout;
+    assert.match(showVercel, /X-Custom-Existing/);
+    assert.match(showVercel, /Content-Security-Policy/);
+
+    // 3. Failing repo build must abort with zero push and zero PR call
+    await fs.writeFile(
+      path.join(seedDir, 'package.json'),
+      JSON.stringify(
+        {
+          name: 'client-site',
+          private: true,
+          scripts: {
+            build: 'node -e "process.exit(1)"',
+          },
+        },
+        null,
+        2
+      ) + '\n',
+      'utf8'
+    );
+    await runGit(['add', 'package.json'], seedDir);
+    await runGit(['commit', '-m', 'Break build for verification test'], seedDir);
+    await runGit(['push', 'origin', 'main'], seedDir);
+
+    let prCalledOnFailure = false;
+    const failedBuildRes = await executeApplyRepoFixes({
+      repo: 'agency/client-site',
+      bundle: bundle as unknown as Record<string, unknown>,
+      branch: 'fix/tourforge-fail-check',
+      dryRun: false,
+      deps: {
+        cloneSource: cloneUrl,
+        createDraftPr: async () => {
+          prCalledOnFailure = true;
+          return 'https://github.com/agency/client-site/pull/99';
+        },
+      },
+    });
+    assert.equal(failedBuildRes.applied, false);
+    assert.equal(failedBuildRes.prUrl, null);
+    assert.equal(prCalledOnFailure, false);
+    assert.match(failedBuildRes.abortedReason || '', /Repo build failed/i);
+
+    const headsAfterFail = (await runGit(['ls-remote', '--heads', bareDir], tmpRoot)).stdout;
+    assert.equal(headsAfterFail.includes('refs/heads/fix/tourforge-fail-check'), false);
+  } finally {
+    await fs.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('VERIFY FIX & MCP BOUNDED APPLY: computes before->after delta including security and keeps tourforge_apply_repo_fixes manual-only', async () => {
+  const verifyCli = parseVerifyCliArgs([
+    '--url',
+    'https://preview.client.example',
+    '--bundle',
+    './bundle.json',
+    '--pr',
+    '42',
+    '--repo',
+    'agency/client-site',
+  ]);
+  assert.equal('help' in verifyCli, false);
+  if (!('help' in verifyCli)) {
+    assert.equal(verifyCli.previewUrl, 'https://preview.client.example');
+    assert.equal(verifyCli.prRef, '42');
+  }
+
+  const weakSec = analyzePassiveSecurity({
+    finalUrl: 'https://client-site.example/',
+    isHttps: true,
+    html: '<html><head><title>Client</title></head><body><h1>Client</h1></body></html>',
+    headers: { 'content-type': 'text/html' },
+  });
+  const beforeAudit = makeMinimalAudit([
+    ...weakSec.findings,
+    {
+      id: 'seo-robots',
+      category: 'seo',
+      label: 'Search crawler rules (robots.txt)',
+      status: 'fail',
+      evidence: 'Blanket Disallow: /',
+      fix: 'Allow',
+      businessImpact: 'Hidden',
+      weight: 5,
+    },
+  ]);
+  beforeAudit.security = weakSec;
+  const beforeBundle = buildAgentOutputBundle({
+    url: 'https://client-site.example/',
+    clientName: 'Client Site',
+    businessType: 'Resort',
+    audit: beforeAudit,
+    scorecard: computeScorecard(beforeAudit, createEmptyManualFootprint(), createDefaultAssumptions()),
+    manual: createEmptyManualFootprint(),
+  });
+
+  const strongSec = analyzePassiveSecurity({
+    finalUrl: 'https://preview.client.example/',
+    isHttps: true,
+    html: '<html><head><title>Client</title></head><body><h1>Client</h1></body></html>',
+    headers: {
+      'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
+      'strict-transport-security': 'max-age=31536000; includeSubDomains',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'strict-origin-when-cross-origin',
+      'permissions-policy': 'camera=()',
+    },
+  });
+  const afterAudit = makeMinimalAudit([
+    ...strongSec.findings,
+    {
+      id: 'seo-robots',
+      category: 'seo',
+      label: 'Search crawler rules (robots.txt)',
+      status: 'pass',
+      evidence: 'Crawlers allowed',
+      fix: 'None',
+      businessImpact: 'Indexed',
+      weight: 1,
+    },
+  ]);
+  afterAudit.security = strongSec;
+
+  const deltaOnly = computeScoreDeltaReport({
+    previewUrl: 'https://preview.client.example/',
+    beforeBundleOrAudit: beforeBundle as unknown as Record<string, unknown>,
+    afterAudit,
+  });
+  assert.match(deltaOnly.overallSummary, /^before \d+ -> after 100 \(\+\d+\)$/);
+  assert.match(deltaOnly.securitySummary, /^before \d+ -> after 100 \(\+\d+\)$/);
+  assert.equal(deltaOnly.resolvedFindingIds.includes('sec-csp'), true);
+  assert.equal(deltaOnly.resolvedFindingIds.includes('seo-robots'), true);
+
+  const postedComments: Array<{ prRef: string; repo?: string | null; body: string }> = [];
+  const verified = await executeVerifyFix({
+    previewUrl: 'https://preview.client.example/',
+    bundle: beforeBundle as unknown as Record<string, unknown>,
+    prRef: '42',
+    repo: 'agency/client-site',
+    deps: {
+      runAudit: async () => afterAudit,
+      postPrComment: async (args) => {
+        postedComments.push(args);
+      },
+    },
+  });
+  assert.equal(verified.commented, true);
+  assert.equal(postedComments.length, 1);
+  assert.equal(postedComments[0].prRef, '42');
+  assert.match(postedComments[0].body, /Passive Security & Headers:.*before \d+ -> after 100/);
+
+  // MCP tools check: tourforge_apply_repo_fixes is registered, rejects unsafe branch 'main', and never runs during tourforge_audit_url
+  assert.equal(MCP_TOOLS.some((t) => t.name === 'tourforge_apply_repo_fixes'), true);
+  await assert.rejects(
+    () =>
+      handleMcpToolCall('tourforge_apply_repo_fixes', {
+        repo: 'agency/client-site',
+        bundle: beforeBundle as unknown as Record<string, unknown>,
+        branch: 'main',
+      }),
+    /Branch must start with "fix\/"/
+  );
+
+  // Ephemeral local HTTP mock for /api/audit verifies tourforge_audit_url does not auto-apply fixes
+  const mockServer = http.createServer((req, res) => {
+    if (req.url === '/api/audit' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(afterAudit));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => mockServer.listen(0, '127.0.0.1', () => resolve()));
+  const addr = mockServer.address();
+  const prevServerUrl = process.env.TOURFORGE_SERVER_URL;
+  try {
+    if (addr && typeof addr === 'object') {
+      process.env.TOURFORGE_SERVER_URL = `http://127.0.0.1:${addr.port}`;
+    }
+    const auditMcpRes = await handleMcpToolCall('tourforge_audit_url', {
+      url: 'https://preview.client.example/',
+    });
+    const payload = JSON.parse(auditMcpRes.content[1].text) as Record<string, unknown>;
+    assert.equal('prUrl' in payload, false);
+    assert.equal('applyPlan' in payload, false);
+    assert.ok(payload.security);
+    assert.ok(payload.repoChanges);
+  } finally {
+    if (prevServerUrl === undefined) {
+      delete process.env.TOURFORGE_SERVER_URL;
+    } else {
+      process.env.TOURFORGE_SERVER_URL = prevServerUrl;
+    }
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+  }
 });
 
 

@@ -87,6 +87,7 @@ mcp_servers:
 | `tourforge_audit_url` | Runs `/api/audit` (or local `enqueueAudit`), computes deterministic `Scorecard` (including `scorecard.securityScore`), `AiReadinessSummary`, `security` (`PassiveSecurityAudit` with TLS, headers, mixed content, cookies, redacted secrets, source maps, third-party scripts, form/CSRF hints), `securityBadge` (`{ eligible, htmlSnippet, svg }`), and `RepoFileChangeAction[]`. |
 | `tourforge_capture_site` | Captures 3–6 desktop screenshots and visible DOM facts via `/api/capture`. |
 | `tourforge_generate_repo_fixes` | Produces ready-to-commit `public/robots.txt`, `public/llms.txt`, `<script type="application/ld+json">`, security header configs (`vercel.json`, `next.config.js`, `_headers`, `nginx.conf`), `security-badge.html` (when `badgeEligible` is true), and a GitHub Issue checklist. |
+| `tourforge_apply_repo_fixes` | Builds a bounded `ApplyPlan` (`dryRun: true` by default) for allowlisted static/config/metadata fixes and opens a Draft PR on a `fix/*` branch only when explicitly invoked with `dryRun: false`. Never runs automatically from `tourforge_audit_url`. |
 | `tourforge_export_bundle` | Outputs a complete `tourforge-bundle.json` file that any teammate can import via **Import JSON** in the TourForge Lite UI. |
 
 ---
@@ -116,14 +117,29 @@ Outputs created in `./audits/client-slug/`:
 
 Add `--ai` (with `OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, or `OLLAMA_URL`) to also append an agent-written **Executive Narrative** verified by numeric grounding.
 
+### Bounded Repo Auto-Fix & Preview Verification CLIs
+
+Apply only allowlisted deterministic fixes (`vercel.json`, `next.config.js`, `_headers`, `nginx.conf`, `public/robots.txt`, `public/llms.txt`, `public/schema.jsonld`, `generated/security-badge.html`, and `TOURFORGE` placeholders in `index.html` / `app/layout.tsx`). Default mode is `--dry-run`; pass `--apply` to push a `fix/tourforge-*` branch and open a Draft PR via `gh`:
+
+```bash
+# 1. Inspect plan + diff locally (no push, no PR)
+npm run fix:repo -- --repo owner/client-website-repo --audit ./audits/client-slug/tourforge-bundle.json
+
+# 2. Apply safe fixes on fix/tourforge-YYYY-MM-DD, run repo lint/build, push branch, and open Draft PR
+npm run fix:repo -- --repo owner/client-website-repo --audit ./audits/client-slug/tourforge-bundle.json --apply
+
+# 3. Re-audit the deployed preview URL and post a "before X -> after Y" proof comment to the PR
+npm run verify:fix -- --url https://preview-pr-12.client-website.com --bundle ./audits/client-slug/tourforge-bundle.json --pr 12 --repo owner/client-website-repo
+```
+
 ---
 
 ## 4. Recommended GitHub Source-of-Truth Loop
 
 1. **Pull `main`** of the website's GitHub repository.
 2. **Audit live/staging URL** via `tourforge_audit_url` (or `npm run audit:cli`).
-3. **Inspect mapped file targets** (`public/robots.txt`, `public/llms.txt`, `index.html` / `app/layout.tsx`, Hero `<img>`, header CTA components) against actual files in the checked-out repo.
+3. **Preview bounded fixes** (`npm run fix:repo -- --dry-run` or `tourforge_apply_repo_fixes`) to review `ApplyPlan` and unified diffs. Unknown/ambiguous findings remain in `unhandledFindings` as GitHub Issues.
 4. **Publish for team visibility**:
-   - Open/update a GitHub Issue using `github-issue.md` (`gh issue create --body-file github-issue.md`), **or**
-   - Commit `generated/*` patches into a Draft PR + attach `tourforge-bundle.json` so non-technical teammates can open it inside TourForge Lite to view the Scorecard and print the PDF Proposal.
+   - Open/update a GitHub Issue using `github-issue.md` (`gh issue create --body-file github-issue.md`) for code-level changes, **and/or**
+   - Run `npm run fix:repo -- --apply` (or `tourforge_apply_repo_fixes` with `dryRun: false`) to open a Draft PR on `fix/tourforge-*`, then confirm with `npm run verify:fix` against the preview deployment.
 5. **Automate weekly regression checks** using `.github/workflows/site-audit.yml`.

@@ -18,6 +18,7 @@ import {
   createEmptyManualFootprint,
 } from '../src/audit/types.ts';
 import { CurrencyCode } from '../src/types/tour.ts';
+import { executeApplyRepoFixes } from './apply-repo-fixes.ts';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -64,6 +65,30 @@ export const MCP_TOOLS: McpToolDefinition[] = [
         shots: { type: 'number', description: 'Screenshot count (3 to 6, default 5)' },
       },
       required: ['url'],
+    },
+  },
+  {
+    name: 'tourforge_apply_repo_fixes',
+    description:
+      'Build a bounded ApplyPlan for allowlisted static/config/metadata fixes from a TourForge bundle and optionally open a Draft PR on a fix branch (defaults to dryRun: true). Never runs automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'GitHub repository slug (owner/name)' },
+        bundle: {
+          type: 'object',
+          description: 'FullProjectBundle or AuditResult JSON from tourforge_export_bundle / tourforge_audit_url',
+        },
+        dryRun: {
+          type: 'boolean',
+          description: 'When true (default), plans and returns the diff without pushing or opening a PR.',
+        },
+        branch: {
+          type: 'string',
+          description: 'Optional fix branch name starting with fix/ (defaults to fix/tourforge-YYYY-MM-DD)',
+        },
+      },
+      required: ['repo', 'bundle'],
     },
   },
   {
@@ -341,6 +366,47 @@ export async function handleMcpToolCall(
     });
     return {
       content: [{ type: 'text', text: JSON.stringify(bundle, null, 2) }],
+    };
+  }
+
+  if (name === 'tourforge_apply_repo_fixes') {
+    const repo = String(args.repo || '').trim();
+    if (!repo) throw new Error('repo (owner/name) is required.');
+    if (!args.bundle || typeof args.bundle !== 'object' || Array.isArray(args.bundle)) {
+      throw new Error('bundle object is required.');
+    }
+    const dryRun = args.dryRun === false ? false : true;
+    const branch = typeof args.branch === 'string' && args.branch.trim() ? args.branch.trim() : undefined;
+
+    const result = await executeApplyRepoFixes({
+      repo,
+      bundle: args.bundle as Record<string, unknown>,
+      branch,
+      dryRun,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              repo: result.repo,
+              branch: result.branch,
+              dryRun: result.dryRun,
+              applied: result.applied,
+              abortedReason: result.abortedReason,
+              applyPlan: result.plan,
+              appliedFiles: result.appliedFiles,
+              skippedFiles: result.skippedFiles,
+              diff: result.diff,
+              prUrl: result.prUrl,
+            },
+            null,
+            2
+          ),
+        },
+      ],
     };
   }
 
